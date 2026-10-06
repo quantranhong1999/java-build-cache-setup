@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.linagora.tmail.sample</groupId>
+        <artifactId>tmail-backend</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>distributed-app</artifactId>
+    <description>Stands for tmail-backend/apps/distributed: the server, packaged as an image by jib</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>jmap-extensions</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- As in TMail's apps/distributed (copy-glowroot-resources): a package-phase execution prepares files in
+                 target/ that jib then adds to the image. Declared before jib, so it runs first in the package phase -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-glowroot-resources</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/glowroot</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>src/main/glowroot</directory>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- As in TMail's apps/distributed: jib buildTar bound to package writes target/jib-image.tar,
+                 which the integration tests load by path (TMail: deployment-tests).
+                 jib packages target/classes (not the module jar) and target/glowroot. -->
+            <plugin>
+                <groupId>com.google.cloud.tools</groupId>
+                <artifactId>jib-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>buildTar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <from>
+                        <!-- Tiny base image: the image content is inspected, never run.
+                             Pinned by digest (G9): a tag can point to new content without changing the cache key -->
+                        <image>busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e</image>
+                    </from>
+                    <to>
+                        <image>tmail-sample/distributed</image>
+                    </to>
+                    <container>
+                        <mainClass>com.linagora.tmail.sample.app.DistributedServer</mainClass>
+                    </container>
+                    <extraDirectories>
+                        <paths>
+                            <path>
+                                <from>target/glowroot</from>
+                                <into>/glowroot</into>
+                            </path>
+                        </paths>
+                    </extraDirectories>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

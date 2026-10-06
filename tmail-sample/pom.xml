@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Root of a small build shaped like the TMail repository, used to triage the Maven build cache.
+  Like TMail's root pom (tmail-backend-parent), it aggregates two parts:
+    james-project/  stands for the james-project submodule: built by TMail CI, but its tests are never run there
+    tmail-backend/  stands for tmail-backend/: the modules TMail CI tests, the only ones using the build cache
+  There is no .mvn/ here on purpose: a build from this root (TMail's Compile stage) does not load the cache extension.
+  See README.md for the module-by-module mapping.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.linagora.tmail.sample</groupId>
+    <artifactId>tmail-sample-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>james-project</module>
+        <module>tmail-backend</module>
+    </modules>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>21</maven.compiler.release>
+        <junit.jupiter.version>5.13.1</junit.jupiter.version>
+        <scala.version>2.13.16</scala.version>
+        <!-- Used by a filtered resource of tmail-backend/ai-bot: like TMail's root pom properties and
+             dependencyManagement, it changes a module's output without changing the module's own pom -->
+        <ai.bot.model>gpt</ai.bot.model>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit.jupiter.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.scala-lang</groupId>
+                <artifactId>scala-library</artifactId>
+                <version>${scala.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.james.sample</groupId>
+                <artifactId>james-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>jmap-extensions</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>distributed-app</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-clean-plugin</artifactId>
+                    <version>3.4.1</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-resources-plugin</artifactId>
+                    <version>3.3.1</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.14.0</version>
+                </plugin>
+                <!-- As in TMail's root pom: tests tagged "unstable" only run with -Punstable-tests -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.5.3</version>
+                    <configuration>
+                        <excludedGroups>unstable</excludedGroups>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>3.4.2</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-install-plugin</artifactId>
+                    <version>3.1.4</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-deploy-plugin</artifactId>
+                    <version>3.1.4</version>
+                </plugin>
+                <plugin>
+                    <groupId>com.google.cloud.tools</groupId>
+                    <artifactId>jib-maven-plugin</artifactId>
+                    <version>3.4.6</version>
+                </plugin>
+                <!-- Same setup as James: src/main/scala is added as a source root at build time -->
+                <plugin>
+                    <groupId>net.alchim31.maven</groupId>
+                    <artifactId>scala-maven-plugin</artifactId>
+                    <version>4.9.10</version>
+                    <configuration>
+                        <scalaVersion>${scala.version}</scalaVersion>
+                        <release>${maven.compiler.release}</release>
+                    </configuration>
+                    <executions>
+                        <execution>
+                            <id>scala-add-source</id>
+                            <goals>
+                                <goal>add-source</goal>
+                            </goals>
+                            <phase>process-resources</phase>
+                        </execution>
+                        <execution>
+                            <id>scala-compile-first</id>
+                            <goals>
+                                <goal>compile</goal>
+                            </goals>
+                            <phase>process-resources</phase>
+                        </execution>
+                        <execution>
+                            <id>scala-test-compile</id>
+                            <goals>
+                                <goal>testCompile</goal>
+                            </goals>
+                            <phase>process-test-resources</phase>
+                        </execution>
+                    </executions>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+
+    <profiles>
+        <!-- As in TMail's root pom: run only the tests tagged "unstable" -->
+        <profile>
+            <id>unstable-tests</id>
+            <build>
+                <pluginManagement>
+                    <plugins>
+                        <plugin>
+                            <groupId>org.apache.maven.plugins</groupId>
+                            <artifactId>maven-surefire-plugin</artifactId>
+                            <version>3.5.3</version>
+                            <configuration>
+                                <excludedGroups combine.self="override"/>
+                                <groups>unstable</groups>
+                            </configuration>
+                        </plugin>
+                    </plugins>
+                </pluginManagement>
+            </build>
+        </profile>
+    </profiles>
+</project>

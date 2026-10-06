@@ -1,0 +1,47 @@
+jenkins:
+  systemMessage: "Maven build cache playground"
+  numExecutors: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: admin
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          # Write access to TMail's folder of the build cache. Only the master branch binds it (see tmail-sample/Jenkinsfile)
+          - usernamePassword:
+              scope: GLOBAL
+              id: maven-build-cache-writer
+              username: tmail-ci
+              password: tmail-ci-password
+
+jobs:
+  - script: |
+      multibranchPipelineJob('tmail-sample') {
+          branchSources {
+              branchSource {
+                  source {
+                      git {
+                          id('tmail-sample')
+                          remote('file:///git/tmail-sample.git')
+                          traits {
+                              gitBranchDiscovery()
+                              gitTagDiscovery()
+                          }
+                      }
+                  }
+              }
+          }
+          factory {
+              workflowBranchProjectFactory {
+                  scriptPath('Jenkinsfile')
+              }
+          }
+      }

@@ -1,0 +1,157 @@
+// TMail's Jenkinsfile stages (Compile, Test, Unstable Tests, Deliver), with the Maven build cache on the Test stage,
+// as proposed in docs/design.md, section 7. Differences with TMail's Jenkinsfile today are marked "CHANGE".
+//
+// Cache policy:
+// - only the Test stage uses the cache: it runs from tmail-backend/, where .mvn/ enables the extension.
+//   The Compile stage (root: James and TMail) runs exactly as today, without cache
+// - master reads and writes; other branches and pull requests only read
+// - tag (release) builds, timer (nightly) builds and IGNORE_BUILD_CACHE builds do not use the cache at all
+// - the local cache lives in the workspace, wiped after each build: the only shared cache is the remote one,
+//   which only master can write
+// - stages reusing what the Test stage left in target/ (Unstable Tests, Deliver) run with the cache off:
+//   a cache-enabled Maven run moves existing target/ outputs aside before running
+// - the James revision and the Test stage's own Maven flags are passed to the Test stage: they are part of every TMail
+//   module's cache key, taken from the pipeline actually executed
+def isMaster() {
+    return env.BRANCH_NAME == 'master'
+}
+
+def isTag() {
+    return env.TAG_NAME != null
+}
+
+def isTimerBuild() {
+    return !currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause').isEmpty()
+}
+
+// Maven flags of the Test stage that may change what the build produces (TMail: '-Dapi.version=1.43').
+// They are repeated in build.cache.ci.flags, part of the cache key (G16)
+def testStageFlags() {
+    return ''
+}
+
+def useBuildCache() {
+    return !(params.IGNORE_BUILD_CACHE || isTag() || isTimerBuild())
+}
+
+def buildCacheOptions() {
+    if (!useBuildCache()) {
+        return '-Dmaven.build.cache.enabled=false'
+    }
+    // TMail: git rev-parse HEAD:james-project (the submodule commit). The sample has no submodule: last commit touching it.
+    // From the workspace root, whatever dir() the caller is in
+    def jamesRevision = sh(script: "git -C '${env.WORKSPACE}' log -1 --format=%H -- james-project", returnStdout: true).trim()
+    if (!jamesRevision) {
+        // Without it every James revision would share the same keys (G13): refuse rather than cache wrongly
+        error('Cannot determine the James revision for the build cache key')
+    }
+    def options = "-Dmaven.build.cache.remote.url=${env.BUILD_CACHE_URL} -Dmaven.build.cache.location=${env.WORKSPACE}/.build-cache" +
+            " -Dbuild.cache.james.revision=${jamesRevision} '-Dbuild.cache.ci.flags=${testStageFlags()}'"
+    if (isMaster()) {
+        // No remote.save.final: a later master build can then complete an entry an interrupted upload left incomplete
+        options += ' -Dmaven.build.cache.remote.save.enabled=true'
+    }
+    return options
+}
+
+pipeline {
+    agent any
+
+    triggers {
+        cron(env.BRANCH_NAME == 'master' ? 'H 2 * * *' : '')
+    }
+
+    parameters {
+        booleanParam(name: 'IGNORE_BUILD_CACHE', defaultValue: false,
+                description: 'Build and test every module from source, without reading or writing the build cache')
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        // TMail's folder on the shared cache server, as seen from the Jenkins container
+        BUILD_CACHE_URL = 'http://build-cache/tmail'
+    }
+
+    stages {
+        stage('Compile') {
+            steps {
+                // As today (TMail adds -T1C and -Dmaven.javadoc.skip=true). No .mvn/ at the root: no cache here
+                sh 'mvn -B clean install -DskipTests'
+            }
+        }
+        stage('Test') {
+            steps {
+                dir('tmail-backend') {
+                    script {
+                        // CHANGE: 'clean install' instead of 'surefire:test', so that tested modules are cached.
+                        // TMail tees this stage to ci-logs before secret masking: on master, where the writer credential is
+                        // bound, run it outside tee (failure reports are for pull requests anyway)
+                        def mvn = "mvn -B -s ../ci/maven-settings.xml clean install ${testStageFlags()} ${buildCacheOptions()}"
+                        if (isMaster() && useBuildCache()) {
+                            withCredentials([usernamePassword(credentialsId: 'maven-build-cache-writer',
+                                    usernameVariable: 'BUILD_CACHE_USER', passwordVariable: 'BUILD_CACHE_PASSWORD')]) {
+                                sh mvn
+                            }
+                        } else {
+                            sh mvn
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    // CHANGE: a fully cached build runs no test, so there may be no report at all
+                    junit(testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true)
+                }
+            }
+        }
+        stage('Unstable Tests') {
+            steps {
+                dir('tmail-backend') {
+                    sh 'find . -path "*/target/surefire-reports" -type d -prune -exec rm -rf {} +'
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        // CHANGE: cache off, so that the restored test classes stay in target/
+                        sh 'mvn -B surefire:test -Punstable-tests -Dmaven.build.cache.enabled=false'
+                    }
+                }
+            }
+            post {
+                always {
+                    junit(testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true)
+                }
+            }
+        }
+        stage('Deliver image') {
+            when {
+                anyOf {
+                    branch 'master'
+                    buildingTag()
+                }
+            }
+            steps {
+                dir('tmail-backend') {
+                    // CHANGE: cache off, so that jib finds target/classes (TMail: jib:build -Pci, pushing to Docker Hub)
+                    sh 'mvn -B -pl distributed-app jib:buildTar -Djib.outputPaths.tar=target/delivered-image.tar -Dmaven.build.cache.enabled=false'
+                    // Playground only: the image must contain the app classes and the glowroot files
+                    sh '''
+                        rm -rf target/image-check && mkdir -p target/image-check
+                        tar -xf distributed-app/target/delivered-image.tar -C target/image-check
+                        for layer in target/image-check/*.tar.gz; do tar -tzf "$layer"; done > target/image-content.txt
+                        grep -q 'app/classes/com/linagora/tmail/sample/app/DistributedServer.class' target/image-content.txt
+                        grep -q 'glowroot/glowroot.properties' target/image-content.txt
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        cleanup {
+            deleteDir()
+        }
+    }
+}

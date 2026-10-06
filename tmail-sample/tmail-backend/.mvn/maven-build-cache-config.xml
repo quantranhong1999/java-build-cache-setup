@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maven build cache configuration proposed for TMail. Defensive by design (docs/design.md, section 5):
+  when the cache cannot be sure a result still holds, the module is built and tested again.
+  Each guard is proven by a triage scenario that runs with and without it (docs/triage.md).
+
+  Scope: this file and extensions.xml live in tmail-backend/.mvn/. Maven loads extensions from the .mvn/ folder of
+  the directory it starts from, so only builds run from tmail-backend/ use the cache: TMail modules only.
+  Builds from the repository root (TMail's Compile stage, which also builds James) run exactly as before, without it.
+-->
+<cache xmlns="http://maven.apache.org/BUILD-CACHE-CONFIG/1.4.0"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://maven.apache.org/BUILD-CACHE-CONFIG/1.4.0 https://maven.apache.org/xsd/build-cache-config-1.4.0.xsd">
+    <configuration>
+        <enabled>true</enabled>
+        <hashAlgorithm>SHA-256</hashAlgorithm>
+        <validateXml>true</validateXml>
+        <!-- G4: only save builds that ran 'clean', never from a target/ holding leftovers of an earlier build -->
+        <mandatoryClean>true</mandatoryClean>
+        <!-- Reads only by default. CI's master job alone adds -Dmaven.build.cache.remote.save.enabled=true (G7),
+             without remote.save.final, so that it can complete an entry an interrupted upload left incomplete.
+             The server hosts several projects, one folder each: TMail's is /tmail -->
+        <remote enabled="true" id="build-cache">
+            <url>http://localhost:8090/tmail</url>
+        </remote>
+        <local>
+            <maxBuildsCached>3</maxBuildsCached>
+        </local>
+        <!-- G10, G11: by default a hit only restores the module's jars. TMail's pipeline also needs the compiled classes:
+             the separate test stages run surefire on target/test-classes, and jib packages target/classes -->
+        <attachedOutputs>
+            <dirNames>
+                <dirName>classes</dirName>
+                <dirName>test-classes</dirName>
+            </dirNames>
+        </attachedOutputs>
+    </configuration>
+
+    <input>
+        <global>
+            <glob>*</glob>
+            <includes>
+                <!-- G2: the extension only scans src/main/java, src/test/java and the resource folders.
+                     Scanning all of src/ also covers src/main/scala and src/test/scala (14 and 7 TMail modules),
+                     hidden files included -->
+                <include includeHidden="true">src/</include>
+                <!-- G14: the key only keeps the dependencies and build plugins of the effective pom, not its properties,
+                     dependencyManagement or resource settings. Hash the module's pom and its ancestors instead (paths are
+                     relative to each module; levels above the repository root simply do not exist). Any change in a parent
+                     pom then rebuilds every module below it -->
+                <include>pom.xml</include>
+                <include>../pom.xml</include>
+                <include>../../pom.xml</include>
+                <include>../../../pom.xml</include>
+                <include>../../../../pom.xml</include>
+                <include>../../../../../pom.xml</include>
+                <!-- G16, conservatively: the Jenkinsfile of the workspace. The flags the executed pipeline passes are in the
+                     key through build.cache.ci.flags (tmail-backend/pom.xml); hashing the workspace Jenkinsfile on top
+                     also rebuilds when the pipeline file itself changes. Ad-hoc -D overrides outside CI are not covered:
+                     only CI writes to the cache -->
+                <include>../Jenkinsfile</include>
+                <include>../../Jenkinsfile</include>
+                <include>../../../Jenkinsfile</include>
+                <include>../../../../Jenkinsfile</include>
+                <include>../../../../../Jenkinsfile</include>
+                <!-- Folders outside src/ that the build packages (TMail: apps/postgres/sample-configuration, added to its
+                     image by jib) -->
+                <include>sample-configuration/</include>
+            </includes>
+        </global>
+    </input>
+
+    <executionControl>
+        <runAlways>
+            <goalsLists>
+                <!-- G6: keep ~/.m2 up to date on a hit: later stages (jib delivery with -pl) resolve modules from there -->
+                <goalsList artifactId="maven-install-plugin">
+                    <goals>
+                        <goal>install</goal>
+                    </goals>
+                </goalsList>
+                <!-- G5: target/jib-image.tar is not a Maven artifact, so a hit would not restore it,
+                     yet TMail's deployment-tests load it by path -->
+                <goalsList artifactId="jib-maven-plugin">
+                    <goals>
+                        <goal>buildTar</goal>
+                    </goals>
+                </goalsList>
+            </goalsLists>
+            <executions>
+                <!-- G5: what jib adds to the image from target/ must be produced again on a hit, before jib runs.
+                     TMail: copy-glowroot-resources, and the download-maven-plugin executions package-glowroot (or
+                     install-glowroot), package-async-profiler and curl-for-healthcheck of apps/distributed, memory, postgres -->
+                <execution artifactId="maven-resources-plugin">
+                    <execIds>
+                        <execId>copy-glowroot-resources</execId>
+                    </execIds>
+                </execution>
+            </executions>
+        </runAlways>
+
+        <!-- G1: a cached module is only reused when these values match the build that saved it: every way to skip,
+             select or ignore tests. A mismatch rebuilds the module.
+             skipValue: a value that makes the plugin do less. A cached build that ran the tests can serve a build
+             that skips them; a cached build that skipped them can never serve a build that runs them. -->
+        <reconcile>
+            <plugins>
+                <plugin artifactId="maven-surefire-plugin" goal="test">
+                    <reconciles>
+                        <reconcile propertyName="skip" skipValue="true"/>
+                        <reconcile propertyName="skipExec" skipValue="true"/>
+                        <reconcile propertyName="skipTests" skipValue="true"/>
+                        <reconcile propertyName="testFailureIgnore" skipValue="true"/>
+                        <reconcile propertyName="test"/>
+                        <reconcile propertyName="includes"/>
+                        <reconcile propertyName="excludes"/>
+                        <reconcile propertyName="includesFile"/>
+                        <reconcile propertyName="excludesFile"/>
+                        <reconcile propertyName="groups"/>
+                        <reconcile propertyName="excludedGroups"/>
+                        <reconcile propertyName="includeJUnit5Engines"/>
+                        <reconcile propertyName="excludeJUnit5Engines"/>
+                        <reconcile propertyName="skipAfterFailureCount"/>
+                    </reconciles>
+                </plugin>
+                <plugin artifactId="maven-failsafe-plugin" goal="integration-test">
+                    <reconciles>
+                        <reconcile propertyName="skip" skipValue="true"/>
+                        <reconcile propertyName="skipExec" skipValue="true"/>
+                        <reconcile propertyName="skipTests" skipValue="true"/>
+                        <reconcile propertyName="skipITs" skipValue="true"/>
+                        <reconcile propertyName="test"/>
+                        <reconcile propertyName="includes"/>
+                        <reconcile propertyName="excludes"/>
+                        <reconcile propertyName="includesFile"/>
+                        <reconcile propertyName="excludesFile"/>
+                        <reconcile propertyName="groups"/>
+                        <reconcile propertyName="excludedGroups"/>
+                        <reconcile propertyName="includeJUnit5Engines"/>
+                        <reconcile propertyName="excludeJUnit5Engines"/>
+                        <reconcile propertyName="skipAfterFailureCount"/>
+                    </reconciles>
+                </plugin>
+                <plugin artifactId="maven-failsafe-plugin" goal="verify">
+                    <reconciles>
+                        <reconcile propertyName="skip" skipValue="true"/>
+                        <reconcile propertyName="testFailureIgnore" skipValue="true"/>
+                    </reconciles>
+                </plugin>
+            </plugins>
+        </reconcile>
+        <!-- Not here on purpose: the JDK (G3) and the James revision (G13). A reconcile mismatch rebuilds the module but
+             cannot save it again (same key, and the server refuses overwrites), so values that legitimately change between
+             CI builds must be part of the key itself: see the build.cache.* properties of tmail-backend/pom.xml -->
+    </executionControl>
+</cache>

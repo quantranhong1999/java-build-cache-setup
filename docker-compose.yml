@@ -1,0 +1,52 @@
+# Playground: the build cache server, and (profile "jenkins") a Jenkins running the TMail-shaped pipeline.
+#   docker compose up -d                      -> cache server on http://localhost:8090 (TMail's cache: /tmail)
+#   docker compose --profile jenkins up -d    -> plus Jenkins on http://localhost:8085 (admin / admin)
+name: java-build-cache
+
+services:
+  build-cache:
+    image: nginx:1.29-alpine
+    ports:
+      - "8090:80"
+    volumes:
+      - ./cache-server/nginx.conf:/etc/nginx/nginx.conf:ro
+      # One writer credential file per project: htpasswd.d/<project>
+      - ./cache-server/htpasswd.d:/etc/nginx/htpasswd.d:ro
+      - ./cache-server/prepare-data.sh:/docker-entrypoint.d/10-prepare-data.sh:ro
+      - cache-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 5s
+      retries: 10
+
+  build-cache-evict:
+    image: alpine:3.22
+    environment:
+      CACHE_RETENTION_DAYS: "21"
+    # Every minute: verifies new entries (an entry is only served once verified), deletes expired and inconsistent ones
+    command: ["sh", "-c", "while true; do /opt/cache-server/evict.sh; sleep 60; done"]
+    volumes:
+      # The folder, not the single file: a single-file bind mount goes stale when the file is replaced
+      - ./cache-server:/opt/cache-server:ro
+      - cache-data:/data
+
+  jenkins:
+    profiles: ["jenkins"]
+    build: ./jenkins
+    ports:
+      - "8085:8080"
+    environment:
+      JAVA_OPTS: >-
+        -Djenkins.install.runSetupWizard=false
+        -Dhudson.plugins.git.GitSCM.ALLOW_LOCAL_CHECKOUT=true
+    volumes:
+      # Bare git repository of tmail-sample, created by scripts/jenkins-e2e.sh
+      - ./work/git:/git:ro
+      - jenkins-home:/var/jenkins_home
+    depends_on:
+      build-cache:
+        condition: service_healthy
+
+volumes:
+  cache-data:
+  jenkins-home:
