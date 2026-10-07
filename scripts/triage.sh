@@ -4,6 +4,7 @@
 # tmail-sample/ mirrors the layout of the TMail repository (details in tmail-sample/README.md):
 #   james-project/james-core          James: TMail CI builds it, never runs its tests, never caches it
 #   james-project/james-mailbox       a James module TMail only gets transitively (through james-core)
+#   james-project/james-mailet        a James module only ai-bot uses
 #   tmail-backend/jmap-extensions     Java + Scala sources, like tmail-backend/jmap/extensions
 #   tmail-backend/ai-bot              a leaf module, like tmail-third-party/ai-bot
 #   tmail-backend/distributed-app     jib buildTar bound to package, like tmail-backend/apps/distributed
@@ -67,6 +68,9 @@ warm_up_seed() {
         MAVEN_SKIP_RC=true mvn -B -f "$SAMPLE/pom.xml" -Dmaven.repo.local="$SEED" clean install \
             && MAVEN_SKIP_RC=true mvn -B -f "$SAMPLE/tmail-backend/pom.xml" -Dmaven.repo.local="$SEED" \
                 -Dmaven.build.cache.enabled=false clean install \
+            && (cd "$SAMPLE/tmail-backend" && MAVEN_SKIP_RC=true ../ci/build-cache-fingerprint.sh com.linagora.tmail.sample \
+                -B -Dmaven.repo.local="$SEED") \
+            && find "$SAMPLE" -name .build-cache-key -type d -prune -exec rm -rf {} + \
             && MAVEN_SKIP_RC=true mvn -B -f "$SAMPLE/pom.xml" -Dmaven.repo.local="$SEED" clean
     } > "$OUT/warm-up.log" 2>&1 || { echo "warm-up failed, see $OUT/warm-up.log"; exit 1; }
     # Agents must not find the sample's own jars there: they come from their own builds or from the cache
@@ -145,8 +149,8 @@ install_james() { # agent, label
 # REACTOR: where Maven starts. "tmail-backend" (default: TMail's Test stage, the only one using the cache), "root"
 #          (TMail's Compile stage: James and TMail, no cache) or "james-project" (James alone, no cache).
 # INSTALL_JAMES: 1 (default) installs James first for tmail-backend builds; pipelines set 0, their Compile stage does it.
-# JAMES_REVISION: 1 (default) passes -Dbuild.cache.james.revision to tmail-backend builds, as the proposed CI does (G13);
-#                 0 leaves it out, to show the risk without it.
+# FINGERPRINT: 1 (default) runs tmail-sample/ci/build-cache-fingerprint.sh before cache-enabled tmail-backend builds, as
+#              the proposed CI does (G13); 0 skips it, to show the risk without it.
 # role: master (writer credential, saves), branch (reads only), branch-tries-save (asks to save, without the credential)
 run_build() { # label, agent, role, maven args...
     local label=$1 agent=$2 role=$3
@@ -160,9 +164,21 @@ run_build() { # label, agent, role, maven args...
     if [ "$reactor" = tmail-backend ] && [ "${INSTALL_JAMES:-1}" = 1 ]; then
         install_james "$agent" "$label"
     fi
-    local revision_args=()
-    if [ "$reactor" = tmail-backend ] && [ "${JAMES_REVISION:-1}" = 1 ]; then
-        revision_args=("-Dbuild.cache.james.revision=$(james_revision)")
+    if [ "$reactor" = tmail-backend ] && [[ " $* " != *" -Dmaven.build.cache.enabled=false "* ]]; then
+        if [ "${FINGERPRINT:-1}" = 1 ]; then
+            local fingerprint_log="$OUT/logs/$SCENARIO-$label.fingerprint.log"
+            if ! (cd "$CHECKOUT/tmail-backend" && env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" ../ci/build-cache-fingerprint.sh \
+                com.linagora.tmail.sample -B -o -s "$CHECKOUT/ci/maven-settings.xml" \
+                "-Dmaven.repo.local=$agent_dir/repository" "-Dmaven.repo.local.tail=$SEED") > "$fingerprint_log" 2>&1; then
+                # As in the pipeline: the stage fails before the build runs
+                LAST_EXIT=1 LAST_SECONDS=0 LAST_HITS="" LAST_BUILT="" LAST_TESTS=0 LAST_UPLOADS=0 LAST_LOG="$fingerprint_log"
+                echo "| $label | $agent | $role | guarded | - | 1 | - | - | - | 0 | 0 | fingerprint failed, build not run |" >> "$RESULTS"
+                printf '  %-24s fingerprint failed, build not run: %s\n' "$label" "$(tail -1 "$fingerprint_log" | cut -c 1-100)"
+                return
+            fi
+        else
+            find "$CHECKOUT" -name .build-cache-key -type d -prune -exec rm -rf {} +
+        fi
     fi
     local args=(-B -f "$pom" -s "$CHECKOUT/ci/maven-settings.xml"
         "-Dmaven.repo.local=$agent_dir/repository" "-Dmaven.repo.local.tail=$SEED"
@@ -184,7 +200,7 @@ run_build() { # label, agent, role, maven args...
     start=$(date +%s)
     # MAVEN_SKIP_RC: ~/.mavenrc may pin JAVA_HOME, which would defeat the JDK scenario
     env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" BUILD_CACHE_USER="$user" BUILD_CACHE_PASSWORD="$password" \
-        mvn "${args[@]}" ${revision_args[@]+"${revision_args[@]}"} "$@" > "$log" 2>&1
+        mvn "${args[@]}" "$@" > "$log" 2>&1
     LAST_EXIT=$?
     LAST_SECONDS=$(( $(date +%s) - start ))
     LAST_LOG="$log"
@@ -255,14 +271,8 @@ change_file() { # file relative to the checkout: adds a comment before the closi
     sed -i '' 's/^}$/    \/\/ changed by the triage\n}/' "$CHECKOUT/$1"
 }
 
-# The James revision TMail is built against. TMail CI would use the submodule commit (git rev-parse HEAD:james-project);
-# the sample has no submodule, so it hashes the James sources
-james_revision() {
-    find "$CHECKOUT/james-project" -type f -not -path "*/target/*" | sort | xargs shasum | shasum | cut -c1-12
-}
-
-change_james_api() { # a new method in James: its jar changes
-    sed -i '' 's/^}$/    public static String farewell(String user) {\n        return "Bye, " + user;\n    }\n}/' "$CHECKOUT/$JAMES_SOURCE"
+change_james_api() { # a new method in a James class (default: james-core): its jar changes
+    sed -i '' 's/^}$/    public static String farewell(String user) {\n        return "Bye, " + user;\n    }\n}/' "$CHECKOUT/${1:-$JAMES_SOURCE}"
 }
 
 image_is_complete() { # image tar relative to the checkout
@@ -281,6 +291,7 @@ image_is_complete() { # image tar relative to the checkout
 AI_BOT_SOURCE=tmail-backend/ai-bot/src/main/java/com/linagora/tmail/sample/aibot/AiBot.java
 JAMES_SOURCE=james-project/james-core/src/main/java/org/apache/james/sample/core/Mailbox.java
 JAMES_TRANSITIVE_SOURCE=james-project/james-mailbox/src/main/java/org/apache/james/sample/mailbox/MailboxNaming.java
+JAMES_MAILET_SOURCE=james-project/james-mailet/src/main/java/org/apache/james/sample/mailet/MailetNames.java
 JMAP_TEST=tmail-backend/jmap-extensions/src/test/java/com/linagora/tmail/sample/jmap/JmapExtensionTest.java
 SCALA_SOURCE=tmail-backend/jmap-extensions/src/main/scala/com/linagora/tmail/sample/jmap/LabelMethod.scala
 IT_TEST=tmail-backend/integration-tests/src/test/java/com/linagora/tmail/sample/it/JmapIntegrationTest.java
@@ -307,7 +318,7 @@ run_todays_pipeline() { # name, agent, role
 #   Test:           mvn clean install                             (tmail-backend)  cache: read, master saves
 #   Unstable Tests: mvn surefire:test -Punstable-tests            (tmail-backend)  cache: off
 #   Deliver:        mvn -pl distributed-app jib:buildTar          (tmail-backend)  cache: off
-# COMPILE_SCOPE=james-only: the Compile stage builds James (and the root pom) only, so TMail is compiled once per pipeline.
+# COMPILE_SCOPE=james-only (option B): the Compile stage builds the root pom and James only, so TMail is compiled once.
 run_proposed_pipeline() { # name, agent, role, extra maven args for the Test stage...
     local name=$1 agent=$2 role=$3
     shift 3
@@ -386,14 +397,14 @@ m4() {
 }
 
 m5() {
-    start_scenario M5 "James change that leaves the jars TMail declares identical" \
-        "a james-project bump touching only James comments or tests" \
-        "every TMail module built and tested anyway: any James revision change counts (G13), since a change TMail only gets transitively cannot be told apart"
+    start_scenario M5 "James change that leaves the jars TMail uses identical" \
+        "a james-project bump touching only James comments, tests, or modules TMail does not use" \
+        "every TMail module restored: James jars are reproducible, so the fingerprints of the James jars each module uses do not change (G13)"
     run_build cold master-1 master clean install
     change_file "$JAMES_SOURCE"
     run_build james-comment-change branch-agent branch clean install
     check "build succeeds" '[ $LAST_EXIT -eq 0 ]'
-    check "every TMail module built and tested" 'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ]'
+    check "every TMail module restored" 'same_set "$LAST_HITS" "$TMAIL_MODULES"'
     end_scenario
 }
 
@@ -419,6 +430,19 @@ m7() {
     echo "# notes" > "$CHECKOUT/tmail-backend/ai-bot/README.md"
     run_build docs-change branch-agent branch clean install
     check "every module restored" 'same_set "$LAST_HITS" "$TMAIL_MODULES"'
+    end_scenario
+}
+
+m8() {
+    start_scenario M8 "James change in a module only one TMail module uses" \
+        "a james-project bump changing, say, mailet code that only tmail-third-party/ai-bot uses" \
+        "only ai-bot built and tested: the other modules' James fingerprints are unchanged (G13)"
+    run_build cold master-1 master clean install
+    change_james_api "$JAMES_MAILET_SOURCE"
+    run_build james-mailet-change branch-agent branch clean install
+    check "build succeeds" '[ $LAST_EXIT -eq 0 ]'
+    check "only ai-bot built" 'same_set "$LAST_BUILT" "ai-bot"'
+    check "only ai-bot tests run ($AI_BOT_TESTS)" '[ $LAST_TESTS -eq $AI_BOT_TESTS ]'
     end_scenario
 }
 
@@ -613,20 +637,23 @@ g7() {
 g13() {
     start_scenario G13 "Change in a James module TMail only gets transitively, breaking a TMail test" \
         "a james-project bump changing james-mailbox-like code (TMail declares the API module, not this one) while the jars TMail declares stay identical" \
-        "with the James revision in the key every TMail module is rebuilt and the broken test fails; without it the stale results are restored"
+        "with the per-module James fingerprint (transitive James jars included) every TMail module is rebuilt and the broken test fails; without it the stale results are restored"
     run_build cold master-1 master clean install
     sed -i '' 's/return user;/return user.toUpperCase();/' "$CHECKOUT/$JAMES_TRANSITIVE_SOURCE"
     run_build transitive-change branch-agent branch clean install
     # Maven stops at the first failing module, so the modules after it are not listed
     check "jmap-extensions, the first TMail module, built, not restored" 'contains "$LAST_BUILT" jmap-extensions && [ -z "$LAST_HITS" ]'
     check "the build fails on the James behaviour change" '[ $LAST_EXIT -ne 0 ] && grep -q "Tests run:.*Failures: [1-9]" "$LAST_LOG"'
+    INSTALL_JAMES=0 run_build james-not-installed james-less-agent branch clean install
+    check "James not installed: the fingerprint fails and the build does not run" \
+        '[ $LAST_EXIT -ne 0 ] && grep -q "not found in" "$LAST_LOG" && [ ! -f "$OUT/logs/$SCENARIO-james-not-installed.log" ]'
 
     wipe_remote_cache
     reset_checkout
-    JAMES_REVISION=0 run_build cold-without-revision master-2 master clean install
+    FINGERPRINT=0 run_build cold-without-fingerprint master-2 master clean install
     sed -i '' 's/return user;/return user.toUpperCase();/' "$CHECKOUT/$JAMES_TRANSITIVE_SOURCE"
-    JAMES_REVISION=0 run_build transitive-change-without-revision branch-agent-2 branch clean install
-    check "risk without the revision: every module restored, build green, the James change ignored" \
+    FINGERPRINT=0 run_build transitive-change-without-fingerprint branch-agent-2 branch clean install
+    check "risk without the fingerprint: every module restored, build green, the James change ignored" \
         '[ $LAST_EXIT -eq 0 ] && same_set "$LAST_HITS" "$TMAIL_MODULES"'
     end_scenario
 }
@@ -669,6 +696,27 @@ g16() {
     check "risk without the guard: every module restored, build green, the flag ignored" \
         '[ $LAST_EXIT -eq 0 ] && same_set "$LAST_HITS" "$TMAIL_MODULES"'
     note "a -D override that the pipeline does not repeat in build.cache.ci.flags (a developer's command line) is still not in the key: only CI writes"
+    end_scenario
+}
+
+g17() {
+    start_scenario G17 "A James bump upgrades a library TMail gets transitively" \
+        "a james-project bump changing a third-party version in James's dependencyManagement (here commons-lang3, which TMail gets through james-core); the James jars themselves are unchanged" \
+        "with the per-module fingerprint (library versions included) every module using it is rebuilt and retested; without it everything is restored"
+    run_build cold master-1 master clean install
+    sed -i '' 's|<commons-lang3.version>3.17.0</commons-lang3.version>|<commons-lang3.version>3.18.0</commons-lang3.version>|' "$CHECKOUT/james-project/pom.xml"
+    run_build library-upgrade branch-agent branch clean install
+    check "build succeeds" '[ $LAST_EXIT -eq 0 ]'
+    check "every TMail module built and tested (they all use james-core, hence the library)" \
+        'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ]'
+
+    wipe_remote_cache
+    reset_checkout
+    FINGERPRINT=0 run_build cold-without-fingerprint master-2 master clean install
+    sed -i '' 's|<commons-lang3.version>3.17.0</commons-lang3.version>|<commons-lang3.version>3.18.0</commons-lang3.version>|' "$CHECKOUT/james-project/pom.xml"
+    FINGERPRINT=0 run_build library-upgrade-without-fingerprint branch-agent-2 branch clean install
+    check "risk without the fingerprint: every module restored, tests not run against the new library" \
+        'same_set "$LAST_HITS" "$TMAIL_MODULES" && [ $LAST_TESTS -eq 0 ]'
     end_scenario
 }
 
@@ -813,20 +861,21 @@ t2() {
 }
 
 t3() {
-    start_scenario T3 "Variant: the Compile stage builds James only" \
-        "the same pipeline, but Compile no longer compiles TMail (built and tested once, in the Test stage)" \
-        "the cache behaves as in T2: the Test stage does not depend on what the Compile stage built"
+    start_scenario T3 "Variant (option B): the Compile stage builds James only" \
+        "the same pipeline, but Compile no longer compiles TMail (built and tested once, in the Test stage); the fingerprint step only needs James installed" \
+        "the cache behaves as in T2, including the per-module James fingerprint"
     COMPILE_SCOPE=james-only run_proposed_pipeline p1 master-1 master
     check "P1 cold master: the Test stage runs the $TMAIL_TESTS TMail tests" '[ $TEST_EXIT -eq 0 ] && [ $TEST_TESTS -eq $TMAIL_TESTS ]'
     check "P1: the delivered image holds the app classes and glowroot files" '[ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
     COMPILE_SCOPE=james-only run_proposed_pipeline p2 fresh-agent branch
     check "P2 no change, another agent: the Test stage restores every module and runs no test" \
         'same_set "$TEST_HITS" "$TMAIL_MODULES" && [ $TEST_TESTS -eq 0 ]'
-    check "P2: the unstable test runs and the delivered image holds the app classes and glowroot files" \
+    check "P2: the unstable test runs and the delivered image is complete" \
         '[ $UNSTABLE_TESTS -eq 1 ] && [ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
-    change_file "$AI_BOT_SOURCE"
+    change_james_api "$JAMES_MAILET_SOURCE"
     COMPILE_SCOPE=james-only run_proposed_pipeline p3 branch-agent-3 branch
-    check "P3 ai-bot change: the Test stage builds and tests ai-bot only" 'same_set "$TEST_BUILT" "ai-bot" && [ $TEST_TESTS -eq $AI_BOT_TESTS ]'
+    check "P3 James change only ai-bot uses: the Test stage builds and tests ai-bot only" \
+        'same_set "$TEST_BUILT" "ai-bot" && [ $TEST_TESTS -eq $AI_BOT_TESTS ]'
     end_scenario
 }
 
@@ -855,7 +904,7 @@ warm_up_seed
 trap '"${COMPOSE[@]}" start build-cache-evict > /dev/null 2>&1' EXIT
 
 if [ $# -eq 0 ]; then
-    set -- M1 M2 M3 M4 M5 M6 M7 G1a G1b G2 G3 G4 G5 G7 G13 G14 G16 O1 O2 O3 O4 T1 T2 T3 T4
+    set -- M1 M2 M3 M4 M5 M6 M7 M8 G1a G1b G2 G3 G4 G5 G7 G13 G14 G16 G17 O1 O2 O3 O4 T1 T2 T3 T4
 fi
 
 {
@@ -864,7 +913,8 @@ fi
     echo "Generated by \`scripts/triage.sh\` on $(date -u +%Y-%m-%dT%H:%MZ), Maven $(mvn -v 2>/dev/null | head -1 | awk '{print $3}'), build cache extension 1.3.0."
     echo "Each scenario starts from an empty remote cache, fresh agents and a pristine tmail-sample."
     echo "Builds run from tmail-backend/ unless the Config column says otherwise; each is preceded by a James install"
-    echo "without cache (logs: *.james.log), as TMail's Compile stage does. Config: guarded ="
+    echo "without cache (logs: *.james.log), as TMail's Compile stage does, and cache-enabled ones by the fingerprint step"
+    echo "(ci/build-cache-fingerprint.sh, logs: *.fingerprint.log) unless a scenario says otherwise. Config: guarded ="
     echo "tmail-sample/tmail-backend/.mvn/maven-build-cache-config.xml, defaults = extension defaults"
     echo "(scripts/configs/unguarded-cache-config.xml), off = -Dmaven.build.cache.enabled=false,"
     echo "none = a build outside tmail-backend/, which does not load the cache extension."

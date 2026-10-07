@@ -8,6 +8,7 @@ without ever trusting a result we are not sure about.
 - Design proposal: [docs/design.md](docs/design.md)
 - Triage results: [docs/triage.md](docs/triage.md), generated tables in [docs/triage-report.md](docs/triage-report.md)
   and [docs/jenkins-e2e-report.md](docs/jenkins-e2e-report.md)
+- Expected savings on TMail, from its real history: [docs/estimate.md](docs/estimate.md)
 - Reviewed in several rounds by Codex (gpt-6.1-sol, xhigh): findings are fixed or listed as residual risks in the design (section 10)
 
 ## Result in short
@@ -20,7 +21,11 @@ without ever trusting a result we are not sure about.
   in the design (section 10).
 - **TMail's Jenkinsfile needs small changes**: the Test stage becomes `clean install` instead of `surefire:test`, and the stages
   reusing `target/` (Unstable Tests, Docker delivery) run with the cache off. Kept as is, the Test stage would pass with 0 tests.
-- **Scope**: TMail modules only. James is built as today, never cached, never tested. Any James bump retests every TMail module.
+- **Scope**: TMail modules only. James is built as today, never cached, never tested. A James bump only retests the TMail modules
+  whose dependency tree holds a James jar it changed (James jars are reproducible, so unchanged ones keep their hash).
+- **Estimated gain** on TMail's 2h48 Test stage: about 50 to 80 minutes of test work skipped per master build on average
+  (gross, before the cache's own overheads), from a replay of its history through the cache rules, with test times from a
+  laptop; the slow JMAP integration suites still rerun on most builds ([docs/estimate.md](docs/estimate.md)).
 - **Shared server**: one folder and one writer credential per project, so other Java projects can use the same server later.
 
 ## How it works
@@ -48,6 +53,7 @@ without ever trusting a result we are not sure about.
 | `scripts/triage.sh` | Runs the triage scenarios against the cache server |
 | `scripts/jenkins-e2e.sh` | Runs the pipeline in Jenkins: master, branch, nightly-like and tag builds |
 | `scripts/configs/` | The extension defaults, used by the triage to show each risk without its guard |
+| `scripts/estimate-tmail-savings.py` | Replays a TMail checkout's master history to estimate the Test stage time saved |
 | `work/` | Generated: dependency cache, agents, logs, reports (git-ignored) |
 
 ## Run it

@@ -104,7 +104,7 @@ record_build() { # branch, number, description
     # Only the delivery stage: the Compile and Test stages also build the image tar (jib buildTar is bound to package)
     LAST_DELIVERED=$(grep -c "Built image tarball" "$log.deliver" || true)
     # Absent when the cache is off
-    LAST_REVISION=$({ grep -oE "build\.cache\.james\.revision=[0-9a-f]*" "$log.test" || true; } | head -1 | cut -d= -f2)
+    LAST_FINGERPRINTED=$(awk '/build cache fingerprint: [0-9]+ modules/ { for (i = 1; i <= NF; i++) if ($i == "modules") { print $(i - 1); exit } }' "$log.test")
     echo "| $1 #$2 | $3 | $LAST_RESULT | ${LAST_DURATION}s | ${LAST_HITS:--} | ${LAST_BUILT:--} | $LAST_TESTS | $LAST_UNSTABLE_TESTS | $LAST_UPLOADS | $LAST_REJECTED | $LAST_DELIVERED |" >> "$RESULTS"
     printf '  %-12s %-9s %4ss test stage: hit=[%s] built=[%s] tests=%s | unstable=%s uploads=%s rejected=%s image=%s\n' \
         "$1 #$2" "$LAST_RESULT" "$LAST_DURATION" "$LAST_HITS" "$LAST_BUILT" "$LAST_TESTS" "$LAST_UNSTABLE_TESTS" \
@@ -169,7 +169,7 @@ check "master #1: the Compile stage does not use the cache" '[ $LAST_COMPILE_LOO
 check "master #1: the Test stage builds every module, runs every test, saves one entry per module" \
     'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ] && [ $LAST_UPLOADS -eq $TMAIL_ENTRIES ]'
 check "master #1: the unstable test runs and the image is delivered" '[ $LAST_UNSTABLE_TESTS -eq 1 ] && [ $LAST_DELIVERED -eq 1 ]'
-check "master #1: the Test stage passes the James revision (G13)" '[ ${#LAST_REVISION} -eq 40 ]'
+check "master #1: the Test stage fingerprints the James jars of every module first (G13)" '[ "${LAST_FINGERPRINTED:-0}" -eq 5 ]'
 
 echo "feature-x #1: ai-bot change on a branch"
 sed -i '' 's/^}$/    \/\/ changed on a branch\n}/' "$WORKING_COPY/tmail-backend/ai-bot/src/main/java/com/linagora/tmail/sample/aibot/AiBot.java"

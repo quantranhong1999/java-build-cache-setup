@@ -52,6 +52,11 @@
                 <version>${project.version}</version>
             </dependency>
             <dependency>
+                <groupId>org.apache.james.sample</groupId>
+                <artifactId>james-mailet</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
                 <groupId>${project.groupId}</groupId>
                 <artifactId>jmap-extensions</artifactId>
                 <version>${project.version}</version>
@@ -118,6 +123,12 @@
                     <groupId>com.google.cloud.tools</groupId>
                     <artifactId>jib-maven-plugin</artifactId>
                     <version>3.4.6</version>
+                </plugin>
+                <!-- Used by ci/build-cache-fingerprint.sh (dependency:build-classpath) -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-dependency-plugin</artifactId>
+                    <version>3.8.1</version>
                 </plugin>
                 <!-- Same setup as James: src/main/scala is added as a source root at build time -->
                 <plugin>

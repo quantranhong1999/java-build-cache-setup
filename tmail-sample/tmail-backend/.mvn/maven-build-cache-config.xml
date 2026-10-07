@@ -63,6 +63,11 @@
                 <include>../../../Jenkinsfile</include>
                 <include>../../../../Jenkinsfile</include>
                 <include>../../../../../Jenkinsfile</include>
+                <!-- G13: what each module gets from outside this reactor (James, and the library versions James brings),
+                     written by ci/build-cache-fingerprint.sh before the build: the content hash of every James jar on the
+                     module's test classpath, transitive ones included. The extension alone only hashes the jars a module
+                     declares. A James bump then only rebuilds the modules using a James jar that changed -->
+                <include includeHidden="true">.build-cache-key/</include>
                 <!-- Folders outside src/ that the build packages (TMail: apps/postgres/sample-configuration, added to its
                      image by jib) -->
                 <include>sample-configuration/</include>
@@ -149,8 +154,8 @@
                 </plugin>
             </plugins>
         </reconcile>
-        <!-- Not here on purpose: the JDK (G3) and the James revision (G13). A reconcile mismatch rebuilds the module but
-             cannot save it again (same key, and the server refuses overwrites), so values that legitimately change between
-             CI builds must be part of the key itself: see the build.cache.* properties of tmail-backend/pom.xml -->
+        <!-- Not here on purpose: the JDK (G3) and the CI flags (G16). A reconcile mismatch rebuilds the module but cannot
+             save it again (same key, and the server refuses overwrites), so values that legitimately change between CI builds
+             must be part of the key itself: see the build.cache.* properties of tmail-backend/pom.xml -->
     </executionControl>
 </cache>

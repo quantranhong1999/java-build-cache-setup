@@ -27,10 +27,6 @@
     </modules>
 
     <properties>
-        <!-- Build cache key (G13): the James revision TMail is built against. CI passes it
-             (-Dbuild.cache.james.revision=<sha>): James is outside this reactor, and the cache only hashes the jars a module
-             declares, so a change in a James module TMail gets transitively would otherwise go unnoticed -->
-        <build.cache.james.revision>none</build.cache.james.revision>
         <!-- Build cache key (G3): the exact JDK, vendor and version, of the build -->
         <build.cache.jdk>${java.vendor} ${java.version}</build.cache.jdk>
         <!-- Build cache key (G16): the Maven flags of the CI Test stage. Properties passed with -D are not in the key; CI repeats
@@ -48,7 +44,6 @@
                     <artifactId>maven-surefire-plugin</artifactId>
                     <configuration>
                         <systemPropertyVariables>
-                            <build.cache.james.revision>${build.cache.james.revision}</build.cache.james.revision>
                             <build.cache.jdk>${build.cache.jdk}</build.cache.jdk>
                             <build.cache.ci.flags>${build.cache.ci.flags}</build.cache.ci.flags>
                         </systemPropertyVariables>

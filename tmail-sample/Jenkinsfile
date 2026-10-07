@@ -10,8 +10,10 @@
 //   which only master can write
 // - stages reusing what the Test stage left in target/ (Unstable Tests, Deliver) run with the cache off:
 //   a cache-enabled Maven run moves existing target/ outputs aside before running
-// - the James revision and the Test stage's own Maven flags are passed to the Test stage: they are part of every TMail
-//   module's cache key, taken from the pipeline actually executed
+// - before the Test stage, ci/build-cache-fingerprint.sh records what each module gets from James (content of the James
+//   jars on its classpath): a James bump then only rebuilds the modules using what changed
+// - the Test stage's own Maven flags are passed in build.cache.ci.flags: part of every module's key, taken from the
+//   pipeline actually executed
 def isMaster() {
     return env.BRANCH_NAME == 'master'
 }
@@ -38,15 +40,8 @@ def buildCacheOptions() {
     if (!useBuildCache()) {
         return '-Dmaven.build.cache.enabled=false'
     }
-    // TMail: git rev-parse HEAD:james-project (the submodule commit). The sample has no submodule: last commit touching it.
-    // From the workspace root, whatever dir() the caller is in
-    def jamesRevision = sh(script: "git -C '${env.WORKSPACE}' log -1 --format=%H -- james-project", returnStdout: true).trim()
-    if (!jamesRevision) {
-        // Without it every James revision would share the same keys (G13): refuse rather than cache wrongly
-        error('Cannot determine the James revision for the build cache key')
-    }
     def options = "-Dmaven.build.cache.remote.url=${env.BUILD_CACHE_URL} -Dmaven.build.cache.location=${env.WORKSPACE}/.build-cache" +
-            " -Dbuild.cache.james.revision=${jamesRevision} '-Dbuild.cache.ci.flags=${testStageFlags()}'"
+            " '-Dbuild.cache.ci.flags=${testStageFlags()}'"
     if (isMaster()) {
         // No remote.save.final: a later master build can then complete an entry an interrupted upload left incomplete
         options += ' -Dmaven.build.cache.remote.save.enabled=true'
@@ -90,6 +85,12 @@ pipeline {
                         // CHANGE: 'clean install' instead of 'surefire:test', so that tested modules are cached.
                         // TMail tees this stage to ci-logs before secret masking: on master, where the writer credential is
                         // bound, run it outside tee (failure reports are for pull requests anyway)
+                        if (useBuildCache()) {
+                            // CHANGE: per-module fingerprint of the James jars each module uses (G13), with the same settings
+                            // and flags as the build below. Fails the stage rather than build without it.
+                            // TMail: own groupId com.linagora.tmail
+                            sh "../ci/build-cache-fingerprint.sh com.linagora.tmail.sample -B -s ../ci/maven-settings.xml ${testStageFlags()}"
+                        }
                         def mvn = "mvn -B -s ../ci/maven-settings.xml clean install ${testStageFlags()} ${buildCacheOptions()}"
                         if (isMaster() && useBuildCache()) {
                             withCredentials([usernamePassword(credentialsId: 'maven-build-cache-writer',

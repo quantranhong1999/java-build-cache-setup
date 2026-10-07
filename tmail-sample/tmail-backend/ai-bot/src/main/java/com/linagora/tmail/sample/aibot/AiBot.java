@@ -6,10 +6,15 @@ import java.io.UncheckedIOException;
 import java.util.Properties;
 
 import org.apache.james.sample.core.Mailbox;
+import org.apache.james.sample.mailet.MailetNames;
 
 public final class AiBot {
     public static String answer(String user, String question) {
         return Mailbox.greet(user) + ", you asked: " + question;
+    }
+
+    public static String mailetName() {
+        return MailetNames.botMailet();
     }
 
     // From src/main/resources/ai-bot.properties, filtered with the root pom's ai.bot.model property
