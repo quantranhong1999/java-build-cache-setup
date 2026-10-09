@@ -1,5 +1,8 @@
 # Expected savings on TMail
 
+Written when TMail's Test stage was one sequential build. TMail now runs it as two parallel branches (about 55 minutes): the
+shares of test work skipped below still hold, but the stage now lasts as long as its slower branch (see the README).
+
 How much of TMail's Test stage (2h48m in master build #1295) the cache would skip, estimated by replaying TMail's real
 `master` history through the cache rules of [design.md](design.md). Script: [`scripts/estimate-tmail-savings.py`](../scripts/estimate-tmail-savings.py),
 run on TMail `master` at `62f0a80b9`, pushes since 2026-07-01.

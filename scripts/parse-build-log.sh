@@ -15,7 +15,8 @@ awk '
     /-+\[ pom \]-+$/ { pom[mod] = 1 }
     /Found cached build, restoring/ { found[mod] = 1 }
     /forcing full project build|continuing with non cached build|violates cache rules|cannot restore|Failed to restore project/ { forced[mod] = 1 }
-    /Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$/ {
+    # Summary line of a module; ", Flakes: N" when a failing test passed on a retry (TMail profile ci-test)
+    /Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+(, Flakes: [0-9]+)?$/ {
         line = $0; sub(".*Tests run: ", "", line); split(line, parts, ","); tests[mod] += parts[1]
     }
     END {

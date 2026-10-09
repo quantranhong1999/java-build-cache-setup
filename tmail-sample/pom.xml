@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Root of a small build shaped like the TMail repository, used to triage the Maven build cache.
-  Like TMail's root pom (tmail-backend-parent), it aggregates two parts:
-    james-project/  stands for the james-project submodule: built by TMail CI, but its tests are never run there
-    tmail-backend/  stands for tmail-backend/: the modules TMail CI tests, the only ones using the build cache
+  Like TMail's root pom (tmail-backend-parent), it aggregates three parts:
+    james-project/    stands for the james-project submodule: built by TMail CI, but its tests are never run there
+    logback-contrib/  stands for logback-contrib/: a TMail module outside tmail-backend/, built by the Compile stage only
+    tmail-backend/    stands for tmail-backend/: the modules TMail CI tests, the only ones using the build cache
   There is no .mvn/ here on purpose: a build from this root (TMail's Compile stage) does not load the cache extension.
   See README.md for the module-by-module mapping.
 -->
@@ -19,6 +20,7 @@
 
     <modules>
         <module>james-project</module>
+        <module>logback-contrib</module>
         <module>tmail-backend</module>
     </modules>
 
@@ -30,6 +32,9 @@
         <!-- Used by a filtered resource of tmail-backend/ai-bot: like TMail's root pom properties and
              dependencyManagement, it changes a module's output without changing the module's own pom -->
         <ai.bot.model>gpt</ai.bot.model>
+        <!-- CHANGE (G19): reproducible jars. The Compile stage rebuilds logback-contrib on every build; with a jar differing
+             each time, the modules declaring it would never be restored. TMail's root pom does not set it today -->
+        <project.build.outputTimestamp>1980-01-01T00:00:02Z</project.build.outputTimestamp>
     </properties>
 
     <dependencyManagement>
@@ -54,6 +59,11 @@
             <dependency>
                 <groupId>org.apache.james.sample</groupId>
                 <artifactId>james-mailet</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>logback-json-classic</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
@@ -124,7 +134,7 @@
                     <artifactId>jib-maven-plugin</artifactId>
                     <version>3.4.6</version>
                 </plugin>
-                <!-- Used by ci/build-cache-fingerprint.sh (dependency:build-classpath) -->
+                <!-- Used by ci/build-cache-fingerprint.sh (dependency:tree) -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-dependency-plugin</artifactId>
@@ -168,6 +178,25 @@
     </build>
 
     <profiles>
+        <!-- As in TMail's root pom: on CI, retry a failing test up to twice; a test passing on a retry is reported as
+             flaky instead of failing the build. The Test stage runs with -Pci-test -->
+        <profile>
+            <id>ci-test</id>
+            <build>
+                <pluginManagement>
+                    <plugins>
+                        <plugin>
+                            <groupId>org.apache.maven.plugins</groupId>
+                            <artifactId>maven-surefire-plugin</artifactId>
+                            <version>3.5.3</version>
+                            <configuration>
+                                <rerunFailingTestsCount>2</rerunFailingTestsCount>
+                            </configuration>
+                        </plugin>
+                    </plugins>
+                </pluginManagement>
+            </build>
+        </profile>
         <!-- As in TMail's root pom: run only the tests tagged "unstable" -->
         <profile>
             <id>unstable-tests</id>

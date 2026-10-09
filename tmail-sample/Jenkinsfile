@@ -1,19 +1,28 @@
-// TMail's Jenkinsfile stages (Compile, Test, Unstable Tests, Deliver), with the Maven build cache on the Test stage,
-// as proposed in docs/design.md, section 7. Differences with TMail's Jenkinsfile today are marked "CHANGE".
+// TMail's Jenkinsfile stages (Compile, Test as two parallel branches, Unstable Tests, Deliver), with the Maven build cache
+// on the Test stage, as proposed in docs/design.md, section 7. Differences with TMail's Jenkinsfile today are marked
+// "CHANGE". TMail's two Test branches come from its branch fasten-tmail-build-08-10-2026.
 //
 // Cache policy:
 // - only the Test stage uses the cache: it runs from tmail-backend/, where .mvn/ enables the extension.
-//   The Compile stage (root: James and TMail) runs exactly as today, without cache
+//   The Compile stage (root: James, logback-contrib and TMail) runs exactly as today, without cache
 // - master reads and writes; other branches and pull requests only read
-// - tag (release) builds, timer (nightly) builds and IGNORE_BUILD_CACHE builds do not use the cache at all
-// - the local cache lives in the workspace, wiped after each build: the only shared cache is the remote one,
-//   which only master can write
-// - stages reusing what the Test stage left in target/ (Unstable Tests, Deliver) run with the cache off:
-//   a cache-enabled Maven run moves existing target/ outputs aside before running
-// - before the Test stage, ci/build-cache-fingerprint.sh records what each module gets from James (content of the James
-//   jars on its classpath): a James bump then only rebuilds the modules using what changed
+// - tag (release) builds, timer (nightly) builds and IGNORE_BUILD_CACHE builds do not use the cache at all: their Test
+//   stage is exactly today's
+// - the local caches live in the workspace, one per Test branch, wiped after each build: the only shared cache is the
+//   remote one, which only master can write
+// - with the cache, each Test branch is a lifecycle build ('clean verify') of its modules (-pl), so that they are
+//   restored, or built, tested and saved. The two branches must not share a source tree: 'clean' in the other modules'
+//   branch would delete the apps' classes and jib images while the integration branch reads them. That branch therefore
+//   runs in its own copy of the sources, next to the workspace (<workspace>@test-modules: at the same depth, so that the
+//   cache keys, which hash the parent poms and the Jenkinsfile up the tree, are the same in both trees); the integration
+//   branch keeps the workspace, with what the Compile stage built (G20)
+// - stages reusing target/ (Unstable Tests, Deliver) run with the cache off, on the workspace
+// - before the Test stage, ci/build-cache-fingerprint.sh records what each module gets from outside tmail-backend/ (James,
+//   logback-contrib: content of their jars): a James bump then only rebuilds the modules using what changed (G13)
 // - the Test stage's own Maven flags are passed in build.cache.ci.flags: part of every module's key, taken from the
-//   pipeline actually executed
+//   pipeline actually executed (G16)
+// - every Maven run installs into, and resolves SNAPSHOTs from, a local repository private to the pipeline: another
+//   pipeline running on the same agent cannot replace the jars this one tests and saves under its keys (G21)
 def isMaster() {
     return env.BRANCH_NAME == 'master'
 }
@@ -26,27 +35,74 @@ def isTimerBuild() {
     return !currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause').isEmpty()
 }
 
-// Maven flags of the Test stage that may change what the build produces (TMail: '-Dapi.version=1.43').
+// Maven flags of the Test stage that may change what the build produces (TMail: '-Dapi.version=1.43 -Pci-test').
 // They are repeated in build.cache.ci.flags, part of the cache key (G16)
 def testStageFlags() {
-    return ''
+    return '-Pci-test'
+}
+
+// CHANGE: a local repository private to the pipeline (wiped with the workspace), the agent's ~/.m2 as a read-only tail for
+// the dependencies it already holds
+def mavenRepository() {
+    return "-Dmaven.repo.local=${env.WORKSPACE}/.repository -Dmaven.repo.local.tail=${env.HOME}/.m2/repository"
+}
+
+// The other modules' Test branch's copy of the sources (G20). A sibling of the workspace, not a folder inside it
+def modulesTree() {
+    return "${env.WORKSPACE}@test-modules"
 }
 
 def useBuildCache() {
     return !(params.IGNORE_BUILD_CACHE || isTag() || isTimerBuild())
 }
 
-def buildCacheOptions() {
-    if (!useBuildCache()) {
-        return '-Dmaven.build.cache.enabled=false'
-    }
-    def options = "-Dmaven.build.cache.remote.url=${env.BUILD_CACHE_URL} -Dmaven.build.cache.location=${env.WORKSPACE}/.build-cache" +
+def buildCacheOptions(String branch) {
+    def options = "-Dmaven.build.cache.remote.url=${env.BUILD_CACHE_URL} -Dmaven.build.cache.location=${env.WORKSPACE}/.build-cache-${branch}" +
             " '-Dbuild.cache.ci.flags=${testStageFlags()}'"
     if (isMaster()) {
         // No remote.save.final: a later master build can then complete an entry an interrupted upload left incomplete
         options += ' -Dmaven.build.cache.remote.save.enabled=true'
     }
     return options
+}
+
+// One branch of the Test stage. As in TMail: the modules under integration-tests/ (TMail: and deployment-tests/) run in one
+// branch, every other module in the other; the split is computed from the directories.
+def runTestBranch(String branch, boolean integrationModules) {
+    // CHANGE: with the cache, the other modules' branch works on its own copy of the sources (see the cache policy)
+    def tree = (useBuildCache() && !integrationModules) ? "${modulesTree()}/tmail-backend" : 'tmail-backend'
+    // CHANGE: with the cache, 'clean verify' instead of 'surefire:test', so that tested modules are cached. Not 'install':
+    // the other branch reads the local repository, and no later stage needs these jars there.
+    // Without the cache, today's command, with the cache explicitly off: tmail-backend/.mvn/ enables it (T1)
+    def goals = useBuildCache() ? "clean verify ${buildCacheOptions(branch)}" : 'surefire:test -Dmaven.build.cache.enabled=false'
+    // CHANGE: with the cache, refuse to build a tree whose modules lack their fingerprint: their keys would silently
+    // ignore what they get from James and logback-contrib (G13)
+    def checkFingerprints = useBuildCache() ? '../ci/build-cache-fingerprint.sh --check' : ''
+    def mvn = """
+        INTEGRATION_MODULES=\$(find integration-tests -name pom.xml -not -path '*/target/*' -not -path '*/src/*' | sed 's#/pom.xml\$##' | sort | paste -sd , -)
+        test -n "\$INTEGRATION_MODULES"
+        if [ "\$INTEGRATION_BRANCH" = true ]; then
+            PROJECTS="\$INTEGRATION_MODULES"
+        else
+            PROJECTS=\$(echo "\$INTEGRATION_MODULES" | sed 's/^/!/; s/,/,!/g')
+        fi
+        ${checkFingerprints}
+        mvn -B -s ../ci/maven-settings.xml ${mavenRepository()} ${goals} ${testStageFlags()} -pl "\$PROJECTS"
+    """
+    withEnv(["INTEGRATION_BRANCH=${integrationModules}"]) {
+        dir(tree) {
+            // TMail tees each branch to ci-logs before secret masking: on master, where the writer credential is bound,
+            // run it outside tee (failure reports are for pull requests anyway)
+            if (isMaster() && useBuildCache()) {
+                withCredentials([usernamePassword(credentialsId: 'maven-build-cache-writer',
+                        usernameVariable: 'BUILD_CACHE_USER', passwordVariable: 'BUILD_CACHE_PASSWORD')]) {
+                    sh mvn
+                }
+            } else {
+                sh mvn
+            }
+        }
+    }
 }
 
 pipeline {
@@ -74,39 +130,57 @@ pipeline {
     stages {
         stage('Compile') {
             steps {
-                // As today (TMail adds -T1C and -Dmaven.javadoc.skip=true). No .mvn/ at the root: no cache here
-                sh 'mvn -B clean install -DskipTests'
+                // As today (TMail adds -T1C, -Dmaven.javadoc.skip=true and excludes custom-james-assembly).
+                // No .mvn/ at the root: no cache here
+                sh "mkdir -p ~/.m2/repository && mvn -B ${mavenRepository()} clean install -DskipTests"
+            }
+        }
+        // CHANGE: new stage, only when the cache is used
+        stage('Prepare Test') {
+            when {
+                expression { useBuildCache() }
+            }
+            steps {
+                dir('tmail-backend') {
+                    // Per-module fingerprint of what each module gets from outside tmail-backend/ (G13), with the same
+                    // settings and flags as the Test stage. Fails the build rather than run the Test stage without it
+                    sh "../ci/build-cache-fingerprint.sh -B -s ../ci/maven-settings.xml ${mavenRepository()} ${testStageFlags()}"
+                }
+                // The other modules' Test branch gets its own copy of what its build reads, fingerprints included, without
+                // any target/: the root pom and Jenkinsfile (in the keys), ci/ and tmail-backend/. Not james-project/ nor
+                // logback-contrib/: the Test stage takes them from the local repository
+                sh """
+                    rm -rf '${modulesTree()}' && mkdir -p '${modulesTree()}'
+                    tar -cf - --exclude='*/target' pom.xml Jenkinsfile ci tmail-backend | tar -xf - -C '${modulesTree()}'
+                """
             }
         }
         stage('Test') {
-            steps {
-                dir('tmail-backend') {
-                    script {
-                        // CHANGE: 'clean install' instead of 'surefire:test', so that tested modules are cached.
-                        // TMail tees this stage to ci-logs before secret masking: on master, where the writer credential is
-                        // bound, run it outside tee (failure reports are for pull requests anyway)
-                        if (useBuildCache()) {
-                            // CHANGE: per-module fingerprint of the James jars each module uses (G13), with the same settings
-                            // and flags as the build below. Fails the stage rather than build without it.
-                            // TMail: own groupId com.linagora.tmail
-                            sh "../ci/build-cache-fingerprint.sh com.linagora.tmail.sample -B -s ../ci/maven-settings.xml ${testStageFlags()}"
-                        }
-                        def mvn = "mvn -B -s ../ci/maven-settings.xml clean install ${testStageFlags()} ${buildCacheOptions()}"
-                        if (isMaster() && useBuildCache()) {
-                            withCredentials([usernamePassword(credentialsId: 'maven-build-cache-writer',
-                                    usernameVariable: 'BUILD_CACHE_USER', passwordVariable: 'BUILD_CACHE_PASSWORD')]) {
-                                sh mvn
-                            }
-                        } else {
-                            sh mvn
-                        }
+            // As in TMail: two Maven builds side by side; a failing branch aborts the other one
+            failFast true
+            parallel {
+                stage('Integration and deployment tests') {
+                    steps {
+                        runTestBranch('integration', true)
+                    }
+                }
+                stage('Other module tests') {
+                    steps {
+                        runTestBranch('modules', false)
                     }
                 }
             }
             post {
                 always {
                     // CHANGE: a fully cached build runs no test, so there may be no report at all
-                    junit(testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true)
+                    junit(testResults: 'tmail-backend/**/target/surefire-reports/*.xml', allowEmptyResults: true)
+                    script {
+                        if (useBuildCache()) {
+                            dir(modulesTree()) {
+                                junit(testResults: 'tmail-backend/**/target/surefire-reports/*.xml', allowEmptyResults: true)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -115,14 +189,14 @@ pipeline {
                 dir('tmail-backend') {
                     sh 'find . -path "*/target/surefire-reports" -type d -prune -exec rm -rf {} +'
                     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        // CHANGE: cache off, so that the restored test classes stay in target/
-                        sh 'mvn -B surefire:test -Punstable-tests -Dmaven.build.cache.enabled=false'
+                        // CHANGE: cache off, so that the test classes of the workspace stay in target/
+                        sh "mvn -B ${mavenRepository()} surefire:test -Punstable-tests -Dmaven.build.cache.enabled=false"
                     }
                 }
             }
             post {
                 always {
-                    junit(testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true)
+                    junit(testResults: 'tmail-backend/**/target/surefire-reports/*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true)
                 }
             }
         }
@@ -136,7 +210,7 @@ pipeline {
             steps {
                 dir('tmail-backend') {
                     // CHANGE: cache off, so that jib finds target/classes (TMail: jib:build -Pci, pushing to Docker Hub)
-                    sh 'mvn -B -pl distributed-app jib:buildTar -Djib.outputPaths.tar=target/delivered-image.tar -Dmaven.build.cache.enabled=false'
+                    sh "mvn -B ${mavenRepository()} -pl distributed-app jib:buildTar -Djib.outputPaths.tar=target/delivered-image.tar -Dmaven.build.cache.enabled=false"
                     // Playground only: the image must contain the app classes and the glowroot files
                     sh '''
                         rm -rf target/image-check && mkdir -p target/image-check
@@ -153,6 +227,9 @@ pipeline {
     post {
         cleanup {
             deleteDir()
+            dir(modulesTree()) {
+                deleteDir()
+            }
         }
     }
 }

@@ -5,21 +5,24 @@
 #   james-project/james-core          James: TMail CI builds it, never runs its tests, never caches it
 #   james-project/james-mailbox       a James module TMail only gets transitively (through james-core)
 #   james-project/james-mailet        a James module only ai-bot uses
+#   logback-contrib                   a TMail module outside tmail-backend/, built by the Compile stage, like logback-contrib/
 #   tmail-backend/jmap-extensions     Java + Scala sources, like tmail-backend/jmap/extensions
 #   tmail-backend/ai-bot              a leaf module, like tmail-third-party/ai-bot
 #   tmail-backend/distributed-app     jib buildTar bound to package, like tmail-backend/apps/distributed
 #   tmail-backend/integration-tests   slow tests loading the app image by path, like the JMAP suites and deployment-tests
 #
 # The cache is configured in tmail-backend/.mvn/, so it only applies to builds started from tmail-backend/:
-# the TMail modules. James is installed in ~/.m2 by a build from the root (or from james-project/), without cache,
-# as TMail's Compile stage does today.
+# the TMail modules. James and logback-contrib are installed in ~/.m2 by a build from the root, without cache,
+# as TMail's Compile stage does today. TMail's Test stage runs as two Maven builds side by side, each on part of the
+# modules (-pl): the integration tests, and the others (run_test_branches).
 #
 # Scenario groups:
-#   M*  cache mechanics, on TMail's Test stage build ('mvn clean install' from tmail-backend/)
+#   M*  cache mechanics, on one build of every TMail module ('mvn clean install' from tmail-backend/)
 #   G*  guards of the cache configuration: each runs with the guard, then with the extension defaults,
 #       to show that the risk is real
 #   O*  operating the cache server
-#   T*  whole TMail pipelines: today's stages with the cache enabled as is, the proposed stages, a variant, a release
+#   T*  whole TMail pipelines: today's stages with the cache enabled as is, the proposed stages, the Test branches
+#       sharing one source tree, a release
 #
 # Every scenario starts from an empty remote cache, fresh agents and a pristine copy of tmail-sample.
 # An "agent" has its own ~/.m2 repository and local build cache: two agents only share the remote cache,
@@ -40,6 +43,8 @@ RESULTS="$OUT/results.md"
 COMPOSE=(docker compose -f "$ROOT/docker-compose.yml")
 GUARDED_CONFIG="$CHECKOUT/tmail-backend/.mvn/maven-build-cache-config.xml"
 UNGUARDED_CONFIG="$ROOT/scripts/configs/unguarded-cache-config.xml"
+# The guarded configuration without multi-module discovery (G18), generated when a scenario needs it
+NO_DISCOVERY_CONFIG="$OUT/no-discovery-cache-config.xml"
 JDK25="$(/usr/libexec/java_home -v 25)"
 JDK21="$(/usr/libexec/java_home -v 21)"
 
@@ -49,6 +54,8 @@ TMAIL_TESTS=9
 AI_BOT_TESTS=3
 # Entries saved by a build from tmail-backend/: 4 jar modules + the tmail-backend aggregator pom
 TMAIL_ENTRIES=5
+# Entries saved by the two Test branches ('clean verify'): the 4 jar modules; the aggregator only runs 'clean', nothing to save
+BRANCH_ENTRIES=4
 APP_IMAGE="tmail-backend/distributed-app/target/jib-image.tar"
 DELIVERED_IMAGE="tmail-backend/distributed-app/target/delivered-image.tar"
 
@@ -68,7 +75,7 @@ warm_up_seed() {
         MAVEN_SKIP_RC=true mvn -B -f "$SAMPLE/pom.xml" -Dmaven.repo.local="$SEED" clean install \
             && MAVEN_SKIP_RC=true mvn -B -f "$SAMPLE/tmail-backend/pom.xml" -Dmaven.repo.local="$SEED" \
                 -Dmaven.build.cache.enabled=false clean install \
-            && (cd "$SAMPLE/tmail-backend" && MAVEN_SKIP_RC=true ../ci/build-cache-fingerprint.sh com.linagora.tmail.sample \
+            && (cd "$SAMPLE/tmail-backend" && MAVEN_SKIP_RC=true ../ci/build-cache-fingerprint.sh \
                 -B -Dmaven.repo.local="$SEED") \
             && find "$SAMPLE" -name .build-cache-key -type d -prune -exec rm -rf {} + \
             && MAVEN_SKIP_RC=true mvn -B -f "$SAMPLE/pom.xml" -Dmaven.repo.local="$SEED" clean
@@ -136,75 +143,104 @@ end_scenario() {
     cat "$CHECKS" >> "$RESULTS"
 }
 
-# Installs James in the agent's ~/.m2 without cache, as TMail's Compile stage does before the Test stage.
-# Always on JDK 25: the James jars are the same whatever JDK the TMail build then uses.
+# Installs what TMail's Compile stage builds outside tmail-backend/ in the agent's ~/.m2, without cache: James, and
+# logback-contrib with its parent (the root pom). Always on JDK 25: these jars are the same whatever JDK the TMail build
+# then uses.
 install_james() { # agent, label
-    env MAVEN_SKIP_RC=true JAVA_HOME="$JDK25" mvn -B -f "$CHECKOUT/james-project/pom.xml" \
+    env MAVEN_SKIP_RC=true JAVA_HOME="$JDK25" mvn -B -f "$CHECKOUT/pom.xml" \
         "-Dmaven.repo.local=$OUT/agents/$1/repository" "-Dmaven.repo.local.tail=$SEED" \
-        clean install -DskipTests > "$OUT/logs/$SCENARIO-$2.james.log" 2>&1 \
+        -pl org.apache.james.sample:james-core,org.apache.james.sample:james-mailet,com.linagora.tmail.sample:logback-json-classic \
+        -am clean install -DskipTests > "$OUT/logs/$SCENARIO-$2.james.log" 2>&1 \
         || echo "  james install failed, see $OUT/logs/$SCENARIO-$2.james.log"
+}
+
+# Maven arguments of an agent and role, into MVN_ARGS, MVN_USER and MVN_PASSWORD: the agent's ~/.m2, a local build cache
+# (default: build-cache), the cache configuration, and for master the writer credential.
+# role: master (writer credential, saves), branch (reads only), branch-tries-save (asks to save, without the credential)
+maven_args() { # agent, role, local cache name
+    local agent_dir="$OUT/agents/$1"
+    MVN_ARGS=(-B -s "$CHECKOUT/ci/maven-settings.xml"
+        "-Dmaven.repo.local=$agent_dir/repository" "-Dmaven.repo.local.tail=$SEED"
+        "-Dmaven.build.cache.location=$agent_dir/${3:-build-cache}" "-Dmaven.build.cache.configPath=$CONFIG")
+    MVN_USER=""
+    MVN_PASSWORD=""
+    case $2 in
+        master)
+            MVN_USER=tmail-ci
+            MVN_PASSWORD=tmail-ci-password
+            # No remote.save.final: a later master build can then complete an entry an interrupted upload left incomplete
+            MVN_ARGS+=(-Dmaven.build.cache.remote.save.enabled=true)
+            ;;
+        branch-tries-save)
+            MVN_ARGS+=(-Dmaven.build.cache.remote.save.enabled=true)
+            ;;
+    esac
+}
+
+# The fingerprint step before a cache-enabled build of tmail-backend/ (G13), as the proposed CI runs it.
+# FINGERPRINT=0 skips it (and removes earlier fingerprints), to show the risk without it.
+# Returns 1, after recording the build as failed, when the fingerprint fails: as in the pipeline, the build does not run.
+fingerprint() { # label, agent, role, maven args of the build (for its flags)...
+    local label=$1 agent=$2 role=$3
+    shift 3
+    if [ "${FINGERPRINT:-1}" != 1 ]; then
+        find "$CHECKOUT" -name .build-cache-key -type d -prune -exec rm -rf {} +
+        return 0
+    fi
+    local flags=() arg
+    for arg in "$@"; do
+        case $arg in
+            -P*) flags+=("$arg") ;;
+        esac
+    done
+    local fingerprint_log="$OUT/logs/$SCENARIO-$label.fingerprint.log"
+    if (cd "$CHECKOUT/tmail-backend" && env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" ../ci/build-cache-fingerprint.sh \
+        -B -o -s "$CHECKOUT/ci/maven-settings.xml" ${flags[@]+"${flags[@]}"} \
+        "-Dmaven.repo.local=$OUT/agents/$agent/repository" "-Dmaven.repo.local.tail=$SEED") > "$fingerprint_log" 2>&1; then
+        return 0
+    fi
+    LAST_EXIT=1 LAST_SECONDS=0 LAST_HITS="" LAST_BUILT="" LAST_TESTS=0 LAST_UPLOADS=0 LAST_LOG="$fingerprint_log"
+    echo "| $label | $agent | $role | guarded | - | 1 | - | - | - | 0 | 0 | fingerprint failed, build not run |" >> "$RESULTS"
+    printf '  %-24s fingerprint failed, build not run: %s\n' "$label" "$(tail -1 "$fingerprint_log" | cut -c 1-100)"
+    return 1
 }
 
 # Runs one Maven build and parses its log into LAST_* variables.
 # REACTOR: where Maven starts. "tmail-backend" (default: TMail's Test stage, the only one using the cache), "root"
-#          (TMail's Compile stage: James and TMail, no cache) or "james-project" (James alone, no cache).
-# INSTALL_JAMES: 1 (default) installs James first for tmail-backend builds; pipelines set 0, their Compile stage does it.
-# FINGERPRINT: 1 (default) runs tmail-sample/ci/build-cache-fingerprint.sh before cache-enabled tmail-backend builds, as
-#              the proposed CI does (G13); 0 skips it, to show the risk without it.
-# role: master (writer credential, saves), branch (reads only), branch-tries-save (asks to save, without the credential)
+#          (TMail's Compile stage: James, logback-contrib and TMail, no cache) or "james-project" (James alone, no cache).
+# INSTALL_JAMES: 1 (default) installs James and logback-contrib first for tmail-backend builds; pipelines set 0, their
+#                Compile stage does it.
+# FINGERPRINT: see fingerprint().
 run_build() { # label, agent, role, maven args...
     local label=$1 agent=$2 role=$3
     shift 3
-    local agent_dir="$OUT/agents/$agent"
     local log="$OUT/logs/$SCENARIO-$label.log"
     local reactor="${REACTOR:-tmail-backend}"
     local pom="$CHECKOUT/$reactor/pom.xml"
     [ "$reactor" = root ] && pom="$CHECKOUT/pom.xml"
-    mkdir -p "$agent_dir"
+    mkdir -p "$OUT/agents/$agent"
     if [ "$reactor" = tmail-backend ] && [ "${INSTALL_JAMES:-1}" = 1 ]; then
         install_james "$agent" "$label"
     fi
     if [ "$reactor" = tmail-backend ] && [[ " $* " != *" -Dmaven.build.cache.enabled=false "* ]]; then
-        if [ "${FINGERPRINT:-1}" = 1 ]; then
-            local fingerprint_log="$OUT/logs/$SCENARIO-$label.fingerprint.log"
-            if ! (cd "$CHECKOUT/tmail-backend" && env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" ../ci/build-cache-fingerprint.sh \
-                com.linagora.tmail.sample -B -o -s "$CHECKOUT/ci/maven-settings.xml" \
-                "-Dmaven.repo.local=$agent_dir/repository" "-Dmaven.repo.local.tail=$SEED") > "$fingerprint_log" 2>&1; then
-                # As in the pipeline: the stage fails before the build runs
-                LAST_EXIT=1 LAST_SECONDS=0 LAST_HITS="" LAST_BUILT="" LAST_TESTS=0 LAST_UPLOADS=0 LAST_LOG="$fingerprint_log"
-                echo "| $label | $agent | $role | guarded | - | 1 | - | - | - | 0 | 0 | fingerprint failed, build not run |" >> "$RESULTS"
-                printf '  %-24s fingerprint failed, build not run: %s\n' "$label" "$(tail -1 "$fingerprint_log" | cut -c 1-100)"
-                return
-            fi
-        else
-            find "$CHECKOUT" -name .build-cache-key -type d -prune -exec rm -rf {} +
-        fi
+        fingerprint "$label" "$agent" "$role" "$@" || return
     fi
-    local args=(-B -f "$pom" -s "$CHECKOUT/ci/maven-settings.xml"
-        "-Dmaven.repo.local=$agent_dir/repository" "-Dmaven.repo.local.tail=$SEED"
-        "-Dmaven.build.cache.location=$agent_dir/build-cache" "-Dmaven.build.cache.configPath=$CONFIG")
-    local user="" password=""
-    case $role in
-        master)
-            user=tmail-ci
-            password=tmail-ci-password
-            # No remote.save.final: a later master build can then complete an entry an interrupted upload left incomplete
-            args+=(-Dmaven.build.cache.remote.save.enabled=true)
-            ;;
-        branch-tries-save)
-            args+=(-Dmaven.build.cache.remote.save.enabled=true)
-            ;;
-    esac
-
+    maven_args "$agent" "$role"
     local start
     start=$(date +%s)
     # MAVEN_SKIP_RC: ~/.mavenrc may pin JAVA_HOME, which would defeat the JDK scenario
-    env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" BUILD_CACHE_USER="$user" BUILD_CACHE_PASSWORD="$password" \
-        mvn "${args[@]}" "$@" > "$log" 2>&1
-    LAST_EXIT=$?
-    LAST_SECONDS=$(( $(date +%s) - start ))
-    LAST_LOG="$log"
+    env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" BUILD_CACHE_USER="$MVN_USER" BUILD_CACHE_PASSWORD="$MVN_PASSWORD" \
+        mvn -f "$pom" "${MVN_ARGS[@]}" "$@" > "$log" 2>&1
+    record_build "$label" "$agent" "$role" "$reactor" "$log" $? $(( $(date +%s) - start )) "$@"
+}
 
+# Parses the log of a finished build into LAST_* variables and the results table
+record_build() { # label, agent, role, reactor, log, exit code, seconds, maven args...
+    local label=$1 agent=$2 role=$3 reactor=$4 log=$5
+    LAST_EXIT=$6
+    LAST_SECONDS=$7
+    LAST_LOG="$log"
+    shift 7
     "$ROOT/scripts/parse-build-log.sh" "$log" > "$log.modules"
     LAST_HITS=$(awk '$2 == "HIT" { print $1 }' "$log.modules" | paste -sd ' ' -)
     LAST_BUILT=$(awk '$2 == "BUILT" { print $1 }' "$log.modules" | paste -sd ' ' -)
@@ -220,12 +256,14 @@ run_build() { # label, agent, role, maven args...
         | sed 's/Plugin parameter mismatch found. Parameter: /mismatch /' | sort -u | head -3 | paste -sd ';' -)
     [ "$LAST_UPLOAD_FAILURES" -gt 0 ] && notes="$notes $LAST_UPLOAD_FAILURES upload(s) rejected"
     grep -q "Tests run:.*Failures: [1-9]" "$log" && notes="$notes test failure"
+    grep -q "Tests run:.*Flakes: [1-9]" "$log" && notes="$notes test passed on a retry (flaky)"
     [ "$LAST_TESTS" -eq 0 ] && grep -q "No tests to run" "$log" && notes="$notes 'No tests to run'"
     grep -q "Moved [0-9]* pre-existing artifacts to staging" "$log" && notes="$notes target/ outputs moved to staging"
     grep -q "Obtaining project build output files failed" "$log" && notes="$notes jib: no target/classes"
 
     local config_name=guarded
     [ "$CONFIG" = "$UNGUARDED_CONFIG" ] && config_name=defaults
+    [ "$CONFIG" = "$NO_DISCOVERY_CONFIG" ] && config_name="guarded, no discovery"
     [[ " $* " == *" -Dmaven.build.cache.enabled=false "* ]] && config_name=off
     [ "$reactor" != tmail-backend ] && config_name="none ($reactor)"
     local jdk_name=25
@@ -292,45 +330,128 @@ AI_BOT_SOURCE=tmail-backend/ai-bot/src/main/java/com/linagora/tmail/sample/aibot
 JAMES_SOURCE=james-project/james-core/src/main/java/org/apache/james/sample/core/Mailbox.java
 JAMES_TRANSITIVE_SOURCE=james-project/james-mailbox/src/main/java/org/apache/james/sample/mailbox/MailboxNaming.java
 JAMES_MAILET_SOURCE=james-project/james-mailet/src/main/java/org/apache/james/sample/mailet/MailetNames.java
+JMAP_SOURCE=tmail-backend/jmap-extensions/src/main/java/com/linagora/tmail/sample/jmap/JmapExtension.java
 JMAP_TEST=tmail-backend/jmap-extensions/src/test/java/com/linagora/tmail/sample/jmap/JmapExtensionTest.java
+LOGBACK_SOURCE=logback-contrib/src/main/java/com/linagora/tmail/sample/logback/JsonLayout.java
 SCALA_SOURCE=tmail-backend/jmap-extensions/src/main/scala/com/linagora/tmail/sample/jmap/LabelMethod.scala
 IT_TEST=tmail-backend/integration-tests/src/test/java/com/linagora/tmail/sample/it/JmapIntegrationTest.java
 
 # ---------------------------------------------------------------- TMail pipelines
 
-# TMail's stages today (its Jenkinsfile), unchanged, with the cache present in tmail-backend/.mvn/:
-#   Compile: mvn clean install -DskipTests                       (root: James and TMail, no cache)
-#   Test:    mvn surefire:test                                    (tmail-backend/: the cache applies)
+# The two branches of TMail's Test stage (Jenkinsfile: runTestBranch), run side by side as Jenkins does: the modules under
+# integration-tests/ (TMail: and deployment-tests/) in one Maven build, every other module in another.
+# TEST_MODE:
+#   proposed     (default) with the cache: 'clean verify', after the fingerprint step; the other modules' branch works on
+#                its own copy of the sources, next to the workspace (checkout@test-modules), made as the Jenkinsfile does
+#   shared-tree  the same, but both branches in the workspace (G20: the risk the copy avoids)
+#   todays       TMail's command today, 'surefire:test', the cache present in tmail-backend/.mvn/ (T1)
+#   off          TMail's command today with the cache off: tag, nightly and IGNORE_BUILD_CACHE builds
+# Sets TEST_* (the two branches together: union of modules, sum of tests and uploads, failing if one fails, both logs in
+# TEST_LOG), TEST_INTEGRATION_* and TEST_MODULES_* (each branch), and TAR_MISSING=1 when the app image the integration
+# tests load (in the workspace) disappeared at some point while the branches ran.
+run_test_branches() { # name, agent, role, extra maven args...
+    local name=$1 agent=$2 role=$3
+    shift 3
+    local mode="${TEST_MODE:-proposed}"
+    TAR_MISSING=0
+    local goals=(clean verify -Pci-test "-Dbuild.cache.ci.flags=-Pci-test")
+    case $mode in
+        todays) goals=(surefire:test -Pci-test) ;;
+        off) goals=(surefire:test -Pci-test -Dmaven.build.cache.enabled=false) ;;
+    esac
+    local modules_tree="$CHECKOUT"
+    if [ "$mode" = proposed ] || [ "$mode" = shared-tree ]; then
+        fingerprint "$name-test" "$agent" "$role" -Pci-test || { keep TEST; return; }
+    fi
+    if [ "$mode" = proposed ]; then
+        # As the Jenkinsfile's 'Prepare Test' stage
+        modules_tree="$CHECKOUT@test-modules"
+        (cd "$CHECKOUT" && rm -rf "$modules_tree" && mkdir -p "$modules_tree" \
+            && tar -cf - --exclude='*/target' pom.xml Jenkinsfile ci tmail-backend | tar -xf - -C "$modules_tree")
+        # G13: a copy that lost its fingerprints (as a first version of this setup did) must not build
+        [ "${DROP_COPY_FINGERPRINTS:-0}" = 1 ] && find "$modules_tree" -name .build-cache-key -type d -prune -exec rm -rf {} +
+    fi
+    local integration_log="$OUT/logs/$SCENARIO-$name-test-integration.log"
+    local modules_log="$OUT/logs/$SCENARIO-$name-test-modules.log"
+    local stop="$OUT/stop-watching-image"
+    local missing="$OUT/logs/$SCENARIO-$name-image-missing"
+    rm -f "$stop" "$missing"
+    (while [ ! -f "$stop" ]; do [ -f "$CHECKOUT/$APP_IMAGE" ] || touch "$missing"; sleep 0.2; done) &
+    local watcher=$!
+    # As the Jenkinsfile: with the cache, each branch first checks that its tree has every module's fingerprint
+    local check=(true)
+    if [ "$mode" = proposed ] || [ "$mode" = shared-tree ]; then
+        check=(../ci/build-cache-fingerprint.sh --check)
+    fi
+    local start
+    start=$(date +%s)
+    maven_args "$agent" "$role" build-cache-integration
+    (cd "$CHECKOUT/tmail-backend" && "${check[@]}" \
+        && env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" BUILD_CACHE_USER="$MVN_USER" BUILD_CACHE_PASSWORD="$MVN_PASSWORD" \
+            mvn -f "$CHECKOUT/tmail-backend/pom.xml" "${MVN_ARGS[@]}" "${goals[@]}" -pl integration-tests "$@") \
+        > "$integration_log" 2>&1 &
+    local integration_pid=$!
+    maven_args "$agent" "$role" build-cache-modules
+    (cd "$modules_tree/tmail-backend" && "${check[@]}" \
+        && env MAVEN_SKIP_RC=true JAVA_HOME="$JDK" BUILD_CACHE_USER="$MVN_USER" BUILD_CACHE_PASSWORD="$MVN_PASSWORD" \
+            mvn -f "$modules_tree/tmail-backend/pom.xml" "${MVN_ARGS[@]}" "${goals[@]}" -pl '!integration-tests' "$@") \
+        > "$modules_log" 2>&1 &
+    local modules_pid=$!
+    local integration_exit modules_exit
+    wait "$integration_pid"
+    integration_exit=$?
+    wait "$modules_pid"
+    modules_exit=$?
+    local seconds=$(( $(date +%s) - start ))
+    touch "$stop"
+    wait "$watcher"
+    TAR_MISSING=0
+    [ -f "$missing" ] && TAR_MISSING=1
+
+    record_build "$name-test-integration" "$agent" "$role" tmail-backend "$integration_log" "$integration_exit" "$seconds" "${goals[@]}" "$@"
+    keep TEST_INTEGRATION
+    record_build "$name-test-modules" "$agent" "$role" tmail-backend "$modules_log" "$modules_exit" "$seconds" "${goals[@]}" "$@"
+    keep TEST_MODULES
+    TEST_EXIT=$(( TEST_INTEGRATION_EXIT > TEST_MODULES_EXIT ? TEST_INTEGRATION_EXIT : TEST_MODULES_EXIT ))
+    TEST_HITS=$(echo "$TEST_INTEGRATION_HITS $TEST_MODULES_HITS" | xargs)
+    TEST_BUILT=$(echo "$TEST_INTEGRATION_BUILT $TEST_MODULES_BUILT" | xargs)
+    TEST_TESTS=$(( TEST_INTEGRATION_TESTS + TEST_MODULES_TESTS ))
+    TEST_UPLOADS=$(( TEST_INTEGRATION_UPLOADS + TEST_MODULES_UPLOADS ))
+    TEST_LOG="$OUT/logs/$SCENARIO-$name-test.log"
+    cat "$integration_log" "$modules_log" > "$TEST_LOG"
+}
+
+# TMail's stages today (its Jenkinsfile, with the two Test branches), unchanged, with the cache present in
+# tmail-backend/.mvn/:
+#   Compile: mvn clean install -DskipTests                       (root: James, logback-contrib and TMail, no cache)
+#   Test:    mvn surefire:test -Pci-test -pl <its modules>, x2    (tmail-backend/: the cache applies)
 #   Deliver: mvn jib:build -pl apps/distributed                   (tmail-backend/; jib:buildTar here, no registry)
 run_todays_pipeline() { # name, agent, role
     REACTOR=root run_build "$1-compile" "$2" "$3" clean install -DskipTests
     keep COMPILE
-    INSTALL_JAMES=0 run_build "$1-test" "$2" "$3" surefire:test
-    keep TEST
+    TEST_MODE=todays run_test_branches "$1" "$2" "$3"
     INSTALL_JAMES=0 run_build "$1-deliver" "$2" "$3" -pl distributed-app jib:buildTar \
         -Djib.outputPaths.tar=target/delivered-image.tar
     keep DELIVER
 }
 
-# Proposed stages (docs/design.md, section 7). Same split as today; the Test stage becomes a lifecycle build;
-# the stages reusing what the Test stage left in target/ run with the cache off.
-#   Compile:        mvn clean install -DskipTests                 (root)           no cache, as today
-#   Test:           mvn clean install                             (tmail-backend)  cache: read, master saves
-#   Unstable Tests: mvn surefire:test -Punstable-tests            (tmail-backend)  cache: off
-#   Deliver:        mvn -pl distributed-app jib:buildTar          (tmail-backend)  cache: off
-# COMPILE_SCOPE=james-only (option B): the Compile stage builds the root pom and James only, so TMail is compiled once.
-run_proposed_pipeline() { # name, agent, role, extra maven args for the Test stage...
+# Proposed stages (docs/design.md, section 7, and tmail-sample/Jenkinsfile). Same split as today; the Test branches become
+# lifecycle builds; the stages reusing what the Test stage left in target/ run with the cache off.
+#   Compile:        mvn clean install -DskipTests                      (root)           no cache, as today
+#   Prepare Test:   ci/build-cache-fingerprint.sh; copy to <workspace>@test-modules (tmail-backend)
+#   Test:           mvn clean verify -Pci-test -pl <its modules>, x2   (tmail-backend)  cache: read, master saves
+#   Unstable Tests: mvn surefire:test -Punstable-tests                 (tmail-backend)  cache: off
+#   Deliver:        mvn -pl distributed-app jib:buildTar               (tmail-backend)  cache: off
+# TEST_MODE: see run_test_branches. CACHE=off: a tag, nightly or IGNORE_BUILD_CACHE build (Test stage as today, cache off).
+run_proposed_pipeline() { # name, agent, role
     local name=$1 agent=$2 role=$3
-    shift 3
-    if [ "${COMPILE_SCOPE:-all}" = james-only ]; then
-        REACTOR=root run_build "$name-compile-root-pom" "$agent" "$role" -N install
-        REACTOR=james-project run_build "$name-compile-james" "$agent" "$role" clean install -DskipTests
-    else
-        REACTOR=root run_build "$name-compile" "$agent" "$role" clean install -DskipTests
-    fi
+    REACTOR=root run_build "$name-compile" "$agent" "$role" clean install -DskipTests
     keep COMPILE
-    INSTALL_JAMES=0 run_build "$name-test" "$agent" "$role" clean install "$@"
-    keep TEST
+    if [ "${CACHE:-on}" = off ]; then
+        TEST_MODE=off run_test_branches "$name" "$agent" "$role"
+    else
+        run_test_branches "$name" "$agent" "$role"
+    fi
     INSTALL_JAMES=0 run_build "$name-unstable" "$agent" "$role" surefire:test -Punstable-tests \
         -Dmaven.build.cache.enabled=false
     keep UNSTABLE
@@ -647,6 +768,9 @@ g13() {
     INSTALL_JAMES=0 run_build james-not-installed james-less-agent branch clean install
     check "James not installed: the fingerprint fails and the build does not run" \
         '[ $LAST_EXIT -ne 0 ] && grep -q "not found in" "$LAST_LOG" && [ ! -f "$OUT/logs/$SCENARIO-james-not-installed.log" ]'
+    DROP_COPY_FINGERPRINTS=1 run_proposed_pipeline copy-without-fingerprints copy-agent branch
+    check "a Test branch whose source tree lacks the fingerprints refuses to build" \
+        '[ $TEST_MODULES_EXIT -ne 0 ] && grep -q "no fingerprint for" "$TEST_MODULES_LOG" && [ -z "$TEST_MODULES_BUILT$TEST_MODULES_HITS" ]'
 
     wipe_remote_cache
     reset_checkout
@@ -717,6 +841,52 @@ g17() {
     FINGERPRINT=0 run_build library-upgrade-without-fingerprint branch-agent-2 branch clean install
     check "risk without the fingerprint: every module restored, tests not run against the new library" \
         'same_set "$LAST_HITS" "$TMAIL_MODULES" && [ $LAST_TESTS -eq 0 ]'
+    end_scenario
+}
+
+g18() {
+    start_scenario G18 "The Test stage split in two -pl builds: a change two modules down" \
+        "TMail's two Test branches each build part of the modules (-pl); a PR changes jmap/extensions, which the JMAP integration tests get through the app, built in the other branch" \
+        "with multi-module discovery the integration tests are rebuilt and retested; without it they are restored: their key then holds the app's installed jar, unchanged, instead of the app's sources"
+    run_proposed_pipeline p1 master-1 master
+    change_file "$JMAP_SOURCE"
+    run_proposed_pipeline p2 branch-agent branch
+    check "integration-tests rebuilt and retested" \
+        '[ $TEST_EXIT -eq 0 ] && contains "$TEST_INTEGRATION_BUILT" integration-tests && [ $TEST_INTEGRATION_TESTS -gt 0 ]'
+
+    sed '/<multiModule>/,/<\/multiModule>/d' "$GUARDED_CONFIG" > "$NO_DISCOVERY_CONFIG"
+    CONFIG="$NO_DISCOVERY_CONFIG"
+    wipe_remote_cache
+    reset_checkout
+    run_proposed_pipeline p3 master-2 master
+    change_file "$JMAP_SOURCE"
+    run_proposed_pipeline p4 branch-agent-2 branch
+    check "risk without discovery: integration-tests restored, its tests not run" \
+        '[ $TEST_EXIT -eq 0 ] && contains "$TEST_INTEGRATION_HITS" integration-tests && [ $TEST_INTEGRATION_TESTS -eq 0 ]'
+    note "without discovery and with jars that are not reproducible, the integration tests would instead never be restored"
+    end_scenario
+}
+
+g19() {
+    start_scenario G19 "A TMail module outside tmail-backend/, rebuilt by every Compile stage" \
+        "logback-contrib: built from the root by the Compile stage, its jar declared by the apps, which the JMAP integration and deployment tests depend on" \
+        "with reproducible jars (project.build.outputTimestamp) every module is restored when nothing changed, and a logback-contrib change rebuilds the app and its tests; without, the app and the integration tests are rebuilt on every build"
+    run_proposed_pipeline p1 master-1 master
+    run_proposed_pipeline p2 fresh-agent branch
+    check "no change: every module restored" '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_HITS" "$TMAIL_MODULES" && [ $TEST_TESTS -eq 0 ]'
+    sed -i '' 's/"{\\"level\\":\\""/"{\\"severity\\":\\""/' "$CHECKOUT/$LOGBACK_SOURCE"
+    run_proposed_pipeline p3 branch-agent branch
+    check "logback-contrib change: distributed-app and integration-tests rebuilt and retested, the others restored" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_BUILT" "distributed-app integration-tests" && same_set "$TEST_HITS" "jmap-extensions ai-bot" && [ $TEST_TESTS -gt 0 ]'
+
+    wipe_remote_cache
+    reset_checkout
+    sed -i '' '/<project.build.outputTimestamp>/d' "$CHECKOUT/pom.xml"
+    run_proposed_pipeline p4 master-2 master
+    sleep 2 # zip entries store time with a 2-second resolution
+    run_proposed_pipeline p5 fresh-agent-2 branch
+    check "risk without reproducible jars: distributed-app and integration-tests rebuilt and retested although nothing changed" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_BUILT" "distributed-app integration-tests" && [ $TEST_TESTS -gt 0 ]'
     end_scenario
 }
 
@@ -807,12 +977,12 @@ o4() {
 
 t1() {
     start_scenario T1 "Today's stages unchanged, the cache added to tmail-backend/" \
-        "today's Jenkinsfile as is: Compile 'install -DskipTests' from the root, Test 'surefire:test' and jib delivery from tmail-backend/" \
+        "today's Jenkinsfile as is: Compile 'install -DskipTests' from the root, Test as two parallel 'surefire:test -pl' builds and jib delivery from tmail-backend/" \
         "the Test stage runs no test yet passes, and the delivery fails: a cached Maven run moves the existing target/ outputs aside before running"
     run_todays_pipeline first master-1 master
     check "the Compile stage (root) does not use the cache" '! grep -q "Attempting to restore project" "$COMPILE_LOG"'
-    check "risk: the Test stage runs 0 tests and passes ('No tests to run')" \
-        '[ $TEST_EXIT -eq 0 ] && [ $TEST_TESTS -eq 0 ] && grep -q "No tests to run" "$TEST_LOG"'
+    check "risk: both Test branches run 0 tests and pass ('No tests to run')" \
+        '[ $TEST_EXIT -eq 0 ] && [ $TEST_TESTS -eq 0 ] && grep -q "No tests to run" "$TEST_INTEGRATION_LOG" && grep -q "No tests to run" "$TEST_MODULES_LOG"'
     check "cause: target/ outputs moved to staging before surefire ran" 'grep -q "pre-existing artifacts to staging" "$TEST_LOG"'
     check "risk: the delivery fails (jib finds no target/classes)" \
         '[ $DELIVER_EXIT -ne 0 ] && grep -q "Obtaining project build output files failed" "$DELIVER_LOG"'
@@ -820,76 +990,84 @@ t1() {
 }
 
 t2() {
-    start_scenario T2 "Proposed pipeline: same split, the Test stage becomes 'clean install'" \
-        "proposed Jenkinsfile (docs/design.md, section 7): Compile as today, Test 'clean install' from tmail-backend/, Unstable Tests and delivery with the cache off" \
-        "unchanged TMail modules are neither rebuilt nor retested; James is never cached nor tested; unstable tests and the delivery keep working"
+    start_scenario T2 "Proposed pipeline: same stages and Test branches, each branch a 'clean verify' build" \
+        "proposed Jenkinsfile (docs/design.md, section 7): Compile as today; a fingerprint step; Test as two parallel 'clean verify -pl' builds from tmail-backend/, the other modules' one on its own copy of the sources; Unstable Tests and delivery with the cache off" \
+        "unchanged TMail modules are neither rebuilt nor retested, in either branch; a change reaches the other branch's modules; James is never cached nor tested; unstable tests and the delivery keep working"
     run_proposed_pipeline p1 master-1 master
     check "P1 cold master: the Compile stage does not use the cache" '! grep -q "Attempting to restore project" "$COMPILE_LOG"'
-    check "P1: the Test stage runs the $TMAIL_TESTS TMail tests and saves $TMAIL_ENTRIES entries" \
-        '[ $TEST_EXIT -eq 0 ] && [ $TEST_TESTS -eq $TMAIL_TESTS ] && [ $TEST_UPLOADS -eq $TMAIL_ENTRIES ]'
+    check "P1: the two Test branches run the $TMAIL_TESTS TMail tests and save $BRANCH_ENTRIES entries, one per jar module" \
+        '[ $TEST_EXIT -eq 0 ] && [ $TEST_TESTS -eq $TMAIL_TESTS ] && [ $TEST_UPLOADS -eq $BRANCH_ENTRIES ]'
+    check "P1: each branch builds its own modules only" \
+        'same_set "$TEST_INTEGRATION_BUILT" integration-tests && same_set "$TEST_MODULES_BUILT" "jmap-extensions ai-bot distributed-app"'
     check "P1: James tests never run" '[ $COMPILE_TESTS -eq 0 ] && ! grep -q "Running org.apache.james" "$TEST_LOG"'
+    check "P1: the app image the integration tests load stays in place during the Test stage" '[ $TAR_MISSING -eq 0 ]'
     check "P1: the unstable test runs" '[ $UNSTABLE_TESTS -eq 1 ]'
     check "P1: the delivered image holds the app classes and glowroot files" '[ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
 
     run_proposed_pipeline p2 fresh-agent branch
-    check "P2 no change, another agent: the Test stage restores every module and runs no test" \
-        'same_set "$TEST_HITS" "$TMAIL_MODULES" && [ $TEST_TESTS -eq 0 ]'
-    check "P2: the unstable test still runs (on restored test-classes)" '[ $UNSTABLE_EXIT -eq 0 ] && [ $UNSTABLE_TESTS -eq 1 ]'
-    check "P2: the delivered image holds the app classes and glowroot files (restored classes)" '[ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
+    check "P2 no change, another agent: both branches restore every module and run no test" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_HITS" "$TMAIL_MODULES" && [ $TEST_TESTS -eq 0 ]'
+    check "P2: the unstable test still runs" '[ $UNSTABLE_EXIT -eq 0 ] && [ $UNSTABLE_TESTS -eq 1 ]'
+    check "P2: the delivered image holds the app classes and glowroot files" '[ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
+    # Keys must not depend on the -pl selection nor on the tree a module was built in (workspace or copy)
+    run_build one-build-of-every-module fresh-agent-2 branch clean verify -Pci-test -Dbuild.cache.ci.flags=-Pci-test
+    check "P2: one build of every module in the workspace (no split) restores them all: same keys whatever the selection and the tree" \
+        '[ $LAST_EXIT -eq 0 ] && same_set "$LAST_HITS" "$TMAIL_MODULES" && [ $LAST_TESTS -eq 0 ]'
 
     change_file "$AI_BOT_SOURCE"
     run_proposed_pipeline p3 branch-agent-3 branch
-    check "P3 ai-bot change: the Test stage builds and tests ai-bot only" 'same_set "$TEST_BUILT" "ai-bot" && [ $TEST_TESTS -eq $AI_BOT_TESTS ]'
+    check "P3 ai-bot change: the Test stage builds and tests ai-bot only" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_BUILT" "ai-bot" && [ $TEST_TESTS -eq $AI_BOT_TESTS ]'
+
+    reset_checkout
+    change_file "$JMAP_SOURCE"
+    run_proposed_pipeline p4 branch-agent-4 branch
+    check "P4 jmap-extensions change: it, the app depending on it and, in the other branch, the integration tests are rebuilt; ai-bot is restored" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_BUILT" "jmap-extensions distributed-app integration-tests" && same_set "$TEST_HITS" ai-bot'
+    check "P4: the app image the integration tests load stays in place during the Test stage" '[ $TAR_MISSING -eq 0 ]'
 
     reset_checkout
     sed -i '' 's/return user;/return user.toUpperCase();/' "$CHECKOUT/$JAMES_TRANSITIVE_SOURCE"
-    run_proposed_pipeline p4 branch-agent-4 branch
-    check "P4 change in a James module TMail only gets transitively: the Test stage rebuilds and its tests fail" \
+    run_proposed_pipeline p5 branch-agent-5 branch
+    check "P5 change in a James module TMail only gets transitively: the Test stage rebuilds and its tests fail" \
         'contains "$TEST_BUILT" jmap-extensions && [ -z "$TEST_HITS" ] && [ $TEST_EXIT -ne 0 ]'
 
     reset_checkout
     change_james_api
-    run_proposed_pipeline p5 branch-agent-5 branch
-    check "P5 James API change: the Test stage builds and tests every TMail module" \
-        'same_set "$TEST_BUILT" "$TMAIL_MODULES" && [ $TEST_TESTS -eq $TMAIL_TESTS ]'
+    run_proposed_pipeline p6 branch-agent-6 branch
+    check "P6 James API change: the Test stage builds and tests every TMail module" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_BUILT" "$TMAIL_MODULES" && [ $TEST_TESTS -eq $TMAIL_TESTS ]'
 
     reset_checkout
     sed -i '' 's/greet("labels")/greet("labels, changed")/' "$CHECKOUT/$SCALA_SOURCE"
-    run_proposed_pipeline p6 branch-agent-6 branch
-    check "P6 broken Scala change: the Test stage fails" '[ $TEST_EXIT -ne 0 ]'
+    run_proposed_pipeline p7 branch-agent-7 branch
+    check "P7 broken Scala change: the Test stage fails" '[ $TEST_EXIT -ne 0 ]'
     end_scenario
 }
 
 t3() {
-    start_scenario T3 "Variant (option B): the Compile stage builds James only" \
-        "the same pipeline, but Compile no longer compiles TMail (built and tested once, in the Test stage); the fingerprint step only needs James installed" \
-        "the cache behaves as in T2, including the per-module James fingerprint"
-    COMPILE_SCOPE=james-only run_proposed_pipeline p1 master-1 master
-    check "P1 cold master: the Test stage runs the $TMAIL_TESTS TMail tests" '[ $TEST_EXIT -eq 0 ] && [ $TEST_TESTS -eq $TMAIL_TESTS ]'
-    check "P1: the delivered image holds the app classes and glowroot files" '[ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
-    COMPILE_SCOPE=james-only run_proposed_pipeline p2 fresh-agent branch
-    check "P2 no change, another agent: the Test stage restores every module and runs no test" \
-        'same_set "$TEST_HITS" "$TMAIL_MODULES" && [ $TEST_TESTS -eq 0 ]'
-    check "P2: the unstable test runs and the delivered image is complete" \
-        '[ $UNSTABLE_TESTS -eq 1 ] && [ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
-    change_james_api "$JAMES_MAILET_SOURCE"
-    COMPILE_SCOPE=james-only run_proposed_pipeline p3 branch-agent-3 branch
-    check "P3 James change only ai-bot uses: the Test stage builds and tests ai-bot only" \
-        'same_set "$TEST_BUILT" "ai-bot" && [ $TEST_TESTS -eq $AI_BOT_TESTS ]'
+    start_scenario T3 "The two Test branches sharing one source tree" \
+        "adopting the cache by changing the command of each Test branch only: both 'clean verify' builds run in the workspace" \
+        "risk: the other modules' branch deletes, then rebuilds, distributed-app's image while the integration branch may be loading it; with its own copy of the sources (T2), the image stays in place"
+    TEST_MODE=shared-tree run_proposed_pipeline p1 master-1 master
+    check "risk: the app image the integration tests load disappears during the Test stage" '[ $TAR_MISSING -eq 1 ]'
+    note "whether an integration test reads the image inside that window depends on timing. When it does, it fails on the missing file; -Pci-test retries it, and it may pass once the image is back: the build stays green, the test reported as flaky"
     end_scenario
 }
 
 t4() {
     start_scenario T4 "Release tag pipeline: cache off" \
-        "a tag build, which delivers the release images" \
-        "nothing read from or written to the cache, every TMail module built and tested from source, even right after master saved the same commit"
+        "a tag build, which delivers the release images (nightly and IGNORE_BUILD_CACHE builds take the same path)" \
+        "nothing read from or written to the cache, every TMail module tested by today's Test stage commands, even right after master saved the same commit"
     run_proposed_pipeline master master-1 master
     local before
     before=$(remote_entry_count)
-    run_proposed_pipeline tag tag-agent branch -Dmaven.build.cache.enabled=false
-    check "the Test stage builds and tests every TMail module" 'same_set "$TEST_BUILT" "$TMAIL_MODULES" && [ $TEST_TESTS -eq $TMAIL_TESTS ]'
+    CACHE=off run_proposed_pipeline tag tag-agent branch
+    check "the Test stage tests every TMail module" \
+        '[ $TEST_EXIT -eq 0 ] && same_set "$TEST_BUILT" "$TMAIL_MODULES" && [ $TEST_TESTS -eq $TMAIL_TESTS ]'
     check "no cache lookup" '! grep -q "Attempting to restore project" "$COMPILE_LOG" "$TEST_LOG"'
-    check "nothing written to the cache" '[ "$(remote_entry_count)" -eq "$before" ] && [ ! -d "$OUT/agents/tag-agent/build-cache" ]'
+    check "nothing written to the cache, no local cache" \
+        '[ "$(remote_entry_count)" -eq "$before" ] && ! ls -d "$OUT/agents/tag-agent/build-cache"* > /dev/null 2>&1'
     check "the delivered image holds the app classes and glowroot files" '[ $DELIVER_EXIT -eq 0 ] && image_is_complete "$DELIVERED_IMAGE"'
     end_scenario
 }
@@ -904,7 +1082,7 @@ warm_up_seed
 trap '"${COMPOSE[@]}" start build-cache-evict > /dev/null 2>&1' EXIT
 
 if [ $# -eq 0 ]; then
-    set -- M1 M2 M3 M4 M5 M6 M7 M8 G1a G1b G2 G3 G4 G5 G7 G13 G14 G16 G17 O1 O2 O3 O4 T1 T2 T3 T4
+    set -- M1 M2 M3 M4 M5 M6 M7 M8 G1a G1b G2 G3 G4 G5 G7 G13 G14 G16 G17 G18 G19 O1 O2 O3 O4 T1 T2 T3 T4
 fi
 
 {
@@ -912,12 +1090,15 @@ fi
     echo
     echo "Generated by \`scripts/triage.sh\` on $(date -u +%Y-%m-%dT%H:%MZ), Maven $(mvn -v 2>/dev/null | head -1 | awk '{print $3}'), build cache extension 1.3.0."
     echo "Each scenario starts from an empty remote cache, fresh agents and a pristine tmail-sample."
-    echo "Builds run from tmail-backend/ unless the Config column says otherwise; each is preceded by a James install"
-    echo "without cache (logs: *.james.log), as TMail's Compile stage does, and cache-enabled ones by the fingerprint step"
+    echo "Builds run from tmail-backend/ unless the Config column says otherwise; each is preceded by an install of James and"
+    echo "logback-contrib without cache (logs: *.james.log), as TMail's Compile stage does (pipelines run that stage instead),"
+    echo "and cache-enabled ones by the fingerprint step"
     echo "(ci/build-cache-fingerprint.sh, logs: *.fingerprint.log) unless a scenario says otherwise. Config: guarded ="
     echo "tmail-sample/tmail-backend/.mvn/maven-build-cache-config.xml, defaults = extension defaults"
     echo "(scripts/configs/unguarded-cache-config.xml), off = -Dmaven.build.cache.enabled=false,"
     echo "none = a build outside tmail-backend/, which does not load the cache extension."
+    echo "In pipelines, <name>-test-integration and <name>-test-modules are the two Test branches, run side by side: their"
+    echo "Time is the whole Test stage."
 } > "$RESULTS"
 
 for scenario in "$@"; do

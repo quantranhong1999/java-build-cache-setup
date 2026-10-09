@@ -18,6 +18,11 @@
             <groupId>${project.groupId}</groupId>
             <artifactId>jmap-extensions</artifactId>
         </dependency>
+        <!-- As TMail's apps: a TMail module built outside tmail-backend/ (G19) -->
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>logback-json-classic</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

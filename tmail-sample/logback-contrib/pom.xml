@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Stands for TMail's logback-contrib/ (logback-json-classic and friends): a TMail module outside tmail-backend/.
+  The Compile stage builds it from the root, every time; the Test stage, from tmail-backend/, gets its jar from the local
+  repository, like a James jar. distributed-app declares it, as TMail's apps do.
+  Its jar must be reproducible (project.build.outputTimestamp, set in the root pom): the modules using it would otherwise
+  get a new cache key on every build, since the Compile stage rebuilds it (G19).
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.linagora.tmail.sample</groupId>
+        <artifactId>tmail-sample-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>logback-json-classic</artifactId>
+</project>

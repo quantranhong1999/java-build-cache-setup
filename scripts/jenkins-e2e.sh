@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end check in Jenkins: the multibranch job of tmail-sample/Jenkinsfile (TMail's stages) against the nginx cache.
+# End-to-end check in Jenkins: the multibranch job of tmail-sample/Jenkinsfile (TMail's stages, with the Test stage as
+# two parallel branches) against the nginx cache.
 #   master #1   cold: builds everything, the Test stage saves to the cache
 #   feature-x   a change in ai-bot on a branch: reads the cache, rebuilds and retests ai-bot only, writes nothing
 #   master #2   no change: the Test stage restores every module and runs no test; the image is still delivered
-#   master #3   IGNORE_BUILD_CACHE=true (what nightly and tag builds do): cache off, everything rebuilt and retested.
+#   master #3   IGNORE_BUILD_CACHE=true (what nightly and tag builds do): cache off, today's Test stage, everything retested.
 #               The nightly timer trigger itself is not exercised: it goes through the same cache-off path
 #   v1.0.0      a release tag: cache off, nothing read or written, image delivered
 #
@@ -25,7 +26,8 @@ COMPOSE=(docker compose -f "$ROOT/docker-compose.yml" --profile jenkins)
 TMAIL_MODULES="jmap-extensions ai-bot distributed-app integration-tests"
 TMAIL_TESTS=9
 AI_BOT_TESTS=3
-TMAIL_ENTRIES=5
+# Saved by the two Test branches ('clean verify'): one entry per jar module
+TMAIL_ENTRIES=4
 
 PASSED=0
 FAILED=0
@@ -87,15 +89,33 @@ record_build() { # branch, number, description
     LAST_DURATION=$(curl -sf -u "$AUTH" "$JOB/job/$1/$2/api/json?tree=duration" \
         | python3 -c 'import json,sys; print(round(json.load(sys.stdin)["duration"] / 1000))')
     # Each stage's part of the console log
-    sed -n '/(Compile)/,/(Test)/p' "$log" > "$log.compile"
+    sed -n '/(Compile)/,/(Prepare Test)/p' "$log" > "$log.compile"
+    sed -n '/(Prepare Test)/,/(Test)/p' "$log" > "$log.prepare"
     sed -n '/(Test)/,/(Unstable Tests)/p' "$log" > "$log.test"
     sed -n '/(Unstable Tests)/,/(Deliver image)/p' "$log" > "$log.unstable"
     sed -n '/(Deliver image)/,$p' "$log" > "$log.deliver"
-    "$ROOT/scripts/parse-build-log.sh" "$log.test" > "$log.test.modules"
+    # The two Test branches run side by side: Jenkins interleaves their lines in the console text, without any branch
+    # prefix. So the Test stage is read from the lines naming their module, and from surefire's summary line of each module
+    local module
+    LAST_HITS=$(for module in $TMAIL_MODULES; do
+        if grep -q "Found cached build, restoring [^ ]*:$module from cache" "$log.test"; then echo "$module"; fi
+    done | paste -sd ' ' -)
+    LAST_BUILT=$(for module in $TMAIL_MODULES; do
+        if grep -q "Building $module [0-9]" "$log.test" && ! grep -q "Found cached build, restoring [^ ]*:$module from cache" "$log.test"; then
+            echo "$module"
+        fi
+    done | paste -sd ' ' -)
+    LAST_TESTS=$({ grep -E "Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+(, Flakes: [0-9]+)?$" "$log.test" || true; } \
+        | sed -E 's/.*Tests run: ([0-9]+),.*/\1/' | awk '{ s += $1 } END { print s + 0 }')
+    # A restore rejected after "Found cached build" (parameter mismatch, missing file...) is logged without the module name:
+    # the modules restored and built cannot be told apart then, and the checks comparing them must fail
+    local rejected
+    rejected=$(grep -cE "forcing full project build|continuing with non cached build|violates cache rules|cannot restore|Failed to restore project" "$log.test" || true)
+    if [ "$rejected" -gt 0 ]; then
+        LAST_HITS="undetermined ($rejected rejected restores)"
+        LAST_BUILT="undetermined"
+    fi
     "$ROOT/scripts/parse-build-log.sh" "$log.unstable" > "$log.unstable.modules"
-    LAST_HITS=$(awk '$2 == "HIT" { print $1 }' "$log.test.modules" | paste -sd ' ' -)
-    LAST_BUILT=$(awk '$2 == "BUILT" { print $1 }' "$log.test.modules" | paste -sd ' ' -)
-    LAST_TESTS=$(awk '{ s += $3 } END { print s + 0 }' "$log.test.modules")
     LAST_UNSTABLE_TESTS=$(awk '{ s += $3 } END { print s + 0 }' "$log.unstable.modules")
     LAST_UPLOADS=$(grep -c "Saved to remote cache .*buildinfo.xml" "$log" || true)
     LAST_REJECTED=$(grep -c "Unable to save to remote cache" "$log" || true)
@@ -104,7 +124,10 @@ record_build() { # branch, number, description
     # Only the delivery stage: the Compile and Test stages also build the image tar (jib buildTar is bound to package)
     LAST_DELIVERED=$(grep -c "Built image tarball" "$log.deliver" || true)
     # Absent when the cache is off
-    LAST_FINGERPRINTED=$(awk '/build cache fingerprint: [0-9]+ modules/ { for (i = 1; i <= NF; i++) if ($i == "modules") { print $(i - 1); exit } }' "$log.test")
+    LAST_FINGERPRINTED=$(awk '/build cache fingerprint: [0-9]+ modules/ { for (i = 1; i <= NF; i++) if ($i == "modules") { print $(i - 1); exit } }' "$log.prepare")
+    # The other modules' branch on its own copy of the sources, both branches refusing to build without fingerprints
+    LAST_COPY=$(grep -c "Running in .*@test-modules/tmail-backend" "$log.test" || true)
+    LAST_CHECKED=$(grep -c "every module has its fingerprint" "$log.test" || true)
     echo "| $1 #$2 | $3 | $LAST_RESULT | ${LAST_DURATION}s | ${LAST_HITS:--} | ${LAST_BUILT:--} | $LAST_TESTS | $LAST_UNSTABLE_TESTS | $LAST_UPLOADS | $LAST_REJECTED | $LAST_DELIVERED |" >> "$RESULTS"
     printf '  %-12s %-9s %4ss test stage: hit=[%s] built=[%s] tests=%s | unstable=%s uploads=%s rejected=%s image=%s\n' \
         "$1 #$2" "$LAST_RESULT" "$LAST_DURATION" "$LAST_HITS" "$LAST_BUILT" "$LAST_TESTS" "$LAST_UNSTABLE_TESTS" \
@@ -169,7 +192,9 @@ check "master #1: the Compile stage does not use the cache" '[ $LAST_COMPILE_LOO
 check "master #1: the Test stage builds every module, runs every test, saves one entry per module" \
     'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ] && [ $LAST_UPLOADS -eq $TMAIL_ENTRIES ]'
 check "master #1: the unstable test runs and the image is delivered" '[ $LAST_UNSTABLE_TESTS -eq 1 ] && [ $LAST_DELIVERED -eq 1 ]'
-check "master #1: the Test stage fingerprints the James jars of every module first (G13)" '[ "${LAST_FINGERPRINTED:-0}" -eq 5 ]'
+check "master #1: the Prepare Test stage fingerprints every module (G13)" '[ "${LAST_FINGERPRINTED:-0}" -eq 5 ]'
+check "master #1: the other modules' Test branch runs on its own copy of the sources, both branches check the fingerprints" \
+    '[ $LAST_COPY -ge 1 ] && [ $LAST_CHECKED -eq 2 ]'
 
 echo "feature-x #1: ai-bot change on a branch"
 sed -i '' 's/^}$/    \/\/ changed on a branch\n}/' "$WORKING_COPY/tmail-backend/ai-bot/src/main/java/com/linagora/tmail/sample/aibot/AiBot.java"
@@ -198,7 +223,8 @@ jenkins_post "/job/tmail-sample/job/master/buildWithParameters?IGNORE_BUILD_CACH
 wait_for_build master 3
 record_build master 3 "IGNORE_BUILD_CACHE=true (as nightly)"
 check "master #3 succeeds" '[ "$LAST_RESULT" = SUCCESS ]'
-check "master #3: the Test stage rebuilds and retests every module" 'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ]'
+check "master #3: the Test stage retests every module, as today (surefire:test, no fingerprint, no copy)" \
+    'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ] && [ -z "${LAST_FINGERPRINTED:-}" ] && [ $LAST_COPY -eq 0 ]'
 check "master #3 neither reads nor writes the cache" '[ $LAST_LOOKUPS -eq 0 ] && [ $LAST_UPLOADS -eq 0 ] && [ $LAST_REJECTED -eq 0 ]'
 
 echo "v1.0.0 #1: release tag"
@@ -214,12 +240,12 @@ jenkins_post "/job/tmail-sample/job/v1.0.0/build?delay=0"
 wait_for_build v1.0.0 1
 record_build v1.0.0 1 "release tag"
 check "the tag build succeeds" '[ "$LAST_RESULT" = SUCCESS ]'
-check "the tag build builds and tests every module from source" 'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ]'
+check "the tag build tests every module, as today" 'same_set "$LAST_BUILT" "$TMAIL_MODULES" && [ $LAST_TESTS -eq $TMAIL_TESTS ]'
 check "the tag build neither reads nor writes the cache" '[ $LAST_LOOKUPS -eq 0 ] && [ $LAST_UPLOADS -eq 0 ] && [ $LAST_REJECTED -eq 0 ]'
 check "the tag build delivers the image" '[ $LAST_DELIVERED -eq 1 ]'
 
-leftover=$("${COMPOSE[@]}" exec -T jenkins sh -c 'find /var/jenkins_home/workspace /var/jenkins_home/.m2 -maxdepth 3 -name ".build-cache" -o -maxdepth 3 -name build-cache 2>/dev/null | wc -l' | tr -d ' \r')
-check "no local build cache left on the agent after the builds" '[ "$leftover" -eq 0 ]'
+leftover=$("${COMPOSE[@]}" exec -T jenkins sh -c 'find /var/jenkins_home/workspace /var/jenkins_home/.m2 -maxdepth 3 \( -name ".build-cache*" -o -name "build-cache*" -o -name ".repository" -o -name "*@test-modules" \) 2>/dev/null | wc -l' | tr -d ' \r')
+check "no local build cache, repository or copy of the sources left on the agent after the builds" '[ "$leftover" -eq 0 ]'
 
 {
     echo

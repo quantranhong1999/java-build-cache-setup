@@ -1,5 +1,8 @@
 # Self-hosted Maven build cache: design proposal
 
+Status: validated in this playground, not adopted for TMail for now (decision and revisit conditions in the
+[README](../README.md#decision-2026-10-09-not-adopted-for-tmail-for-now)).
+
 Status: proposal, validated in this playground (results in [triage.md](triage.md)) and reviewed in several rounds by Codex
 (gpt-6.1-sol, xhigh); the review's findings are fixed or listed in section 10.
 First target: the TMail backend CI (`linagora/tmail-backend`, Jenkins). The cache server is shared: other Linagora Java
@@ -69,7 +72,11 @@ in `tmail-backend/.mvn/`, not at the repository root, so:
 - the Compile stage (Maven from the root: James and TMail) runs exactly as today, without the extension;
 - the Test stage (Maven from `tmail-backend/`) uses the cache, for TMail modules only.
 
-In the Test stage, James modules are outside the reactor: they come as jars from `~/.m2`, installed by the Compile stage.
+In the Test stage, James modules and `logback-contrib` (a TMail module outside `tmail-backend/`) are outside the reactor: they
+come as jars from `~/.m2`, installed by the Compile stage.
+
+TMail's Test stage now runs as two Maven builds side by side, each on part of the modules (`-pl`): the modules under
+`integration-tests/` and `deployment-tests/`, and every other module. Section 7 shows how the cache fits that split.
 
 ### What happens for each module
 
@@ -99,7 +106,11 @@ Read from the 1.3.0 sources (`MavenProjectInput`, `DefaultNormalizedModelProvide
 - For each dependency **in the same reactor** (other TMail modules): that module's key, so a change invalidates everything downstream,
   even when only tests changed (M6).
 - For each SNAPSHOT dependency **outside the reactor**: the hash of the jar the module **declares**. Not the jars it gets
-  transitively.
+  transitively. TMail's apps declare `logback-contrib` jars, which the Compile stage rebuilds every time: they must be
+  reproducible, or the apps and everything depending on them get a new key on every build (G19).
+- "The reactor" is, by default, only the modules selected with `-pl`: a dependency on a TMail module built in the other Test
+  branch would be keyed by its installed jar instead of its sources. Multi-module discovery keeps keys independent of the
+  selection (G18).
 - External release dependencies: only their version, as written in the dependencies.
 
 **What the proposed configuration adds**, so that the key covers what the build actually depends on:
@@ -108,7 +119,7 @@ Read from the 1.3.0 sources (`MavenProjectInput`, `DefaultNormalizedModelProvide
 |---|---|---|---|
 | Every file under `src/`, hidden files included | Global include `src/` (`includeHidden`) | `src/main/scala` (14 TMail modules) and `src/test/scala` (7) are not scanned by default | G2 |
 | The module's `pom.xml` and every parent `pom.xml` up the tree | Global includes `pom.xml`, `../pom.xml` ... `../../../../../pom.xml` | Properties, `dependencyManagement` (transitive versions) and resource settings are not in the default key. Any change in a parent pom rebuilds every module below it | G14 |
-| What each module gets from outside the reactor | Before the Test stage, [`ci/build-cache-fingerprint.sh`](../tmail-sample/ci/build-cache-fingerprint.sh) writes each module's dependency tree to `<module>/.build-cache-key/classpath.txt`: James jars with their SHA-256, transitive and test ones included, and every library with its version. The config hashes that folder | James is outside the Test stage reactor and the extension only hashes the jars a module declares: a change in a James module TMail gets transitively, or a library version James manages, would go unnoticed. With the fingerprint, a James bump only rebuilds the modules using what changed | G13 |
+| What each module gets from outside the reactor | Before the Test stage, [`ci/build-cache-fingerprint.sh`](../tmail-sample/ci/build-cache-fingerprint.sh) writes each module's dependency tree to `<module>/.build-cache-key/classpath.txt`: SNAPSHOT jars from outside `tmail-backend/` (James, `logback-contrib`) with their SHA-256, transitive and test ones included, and every library with its version. The config hashes that folder; each Test branch checks that every module of its tree has it | James is outside the Test stage reactor and the extension only hashes the jars a module declares: a change in a James module TMail gets transitively, or a library version James manages, would go unnoticed. With the fingerprint, a James bump only rebuilds the modules using what changed | G13 |
 | The exact JDK, vendor and version | `build.cache.jdk = ${java.vendor} ${java.version}`, same mechanism | A JDK update, even minor, or another vendor | G3 |
 | The Test stage's Maven flags | The executed pipeline repeats them in `-Dbuild.cache.ci.flags=...`, put into the surefire configuration in `tmail-backend/pom.xml` | Properties passed with `-D` are not in the key. For fork PRs, Jenkins runs the target branch's Jenkinsfile while the workspace may hold an older one, so the flags must come from the executed pipeline | G16 |
 | The workspace Jenkinsfile | Global includes `../Jenkinsfile` ... `../../../../../Jenkinsfile` | Conservative extra: any change to the pipeline file rebuilds everything | G16 |
@@ -133,23 +144,27 @@ Each guard has a triage scenario that runs with the guard and without it.
 
 | # | Risk | Guard | Proven by |
 |---|---|---|---|
-| G1 | An entry saved by a build that skipped, filtered or ignored tests is reused as if tests had passed | `reconcile` on surefire and failsafe for every way to skip or select tests: `skip`, `skipExec`, `skipTests`, `testFailureIgnore`, `test`, `includes`, `excludes`, `includesFile`, `excludesFile`, `groups`, `excludedGroups`, JUnit 5 engine filters, `skipAfterFailureCount`. A build that ran the tests may serve one that skips them, never the reverse. And only master saves, with a fixed command line | G1a, G1b |
+| G1 | An entry saved by a build that skipped, filtered or ignored tests is reused as if tests had passed | `reconcile` on surefire and failsafe for every way to skip, select or retry tests: `skip`, `skipExec`, `skipTests`, `testFailureIgnore`, `test`, `includes`, `excludes`, `includesFile`, `excludesFile`, `groups`, `excludedGroups`, JUnit 5 engine filters, `skipAfterFailureCount`, `rerunFailingTestsCount` (TMail's `-Pci-test`). A build that ran the tests may serve one that skips them, never the reverse. And only master saves, with a fixed command line | G1a, G1b |
 | G2 | A change in a source root the extension does not scan is ignored | Global include `src/` | G2 |
 | G3 | An entry built on another JDK is reused | Exact JDK in the key | G3 |
 | G4 | An entry is saved from a dirty `target/` | `mandatoryClean=true`: only builds that ran `clean` are saved (CI must not pass `-Dmaven.clean.skip`) | G4 |
 | G5 | Files produced as a side effect are missing on a hit: the jib image tar read by path by deployment tests, and what jib adds from `target/` | `runAlways` for jib `buildTar` and for the executions preparing its extra directories (TMail: `copy-glowroot-resources`, and the `download-maven-plugin` executions for glowroot, async-profiler and curl) | G5, M2 |
-| G6 | `install` is skipped on a hit, so `~/.m2` lacks the jars for a later Maven run (jib delivery with `-pl`) | `runAlways` for `maven-install-plugin:install` | M2 |
+| G6 | `install` is skipped on a hit, so `~/.m2` lacks the jars for a later Maven run (jib delivery with `-pl`) | `runAlways` for `maven-install-plugin:install`. The proposed Test branches run `verify`, not `install`: nothing after them reads their jars from `~/.m2` | M2 |
 | G7 | Cache poisoning: a PR build, a leaked credential, or another project writes entries that TMail later trusts | Only the master job saves; nginx rejects PUT without that project's writer credential; one credential per project folder; nginx refuses to overwrite an existing file (409), and serializes writes to the same path, so two concurrent PUTs cannot overwrite each other | G7 |
 | G7b | Poisoning through an agent's local cache shared by builds | CI keeps the local cache in the workspace (`-Dmaven.build.cache.location=$WORKSPACE/.build-cache`), wiped by `deleteDir()` | Jenkins e2e |
 | G8 | Cache server down or slow | Nothing to do: builds continue without the cache | O1 |
 | G9 | Something outside the key changed (Docker image, external service), or a flaky test passed once and got cached | Pin Docker images by digest (the sample pins its jib base image): the digest is then in the key. Nightly master build with the cache off for the rest. If it fails while master is green, purge TMail's folder on the server (the cache is disposable) | Jenkins e2e |
 | G10 | A hit restores jars only, but later stages use `target/classes` (jib) and `target/test-classes` (Unstable Tests) | `<attachedOutputs>` stores and restores `classes` and `test-classes` | T2, G5 |
-| G11 | A Maven run with the cache on moves the existing `target/` outputs aside: a stage reusing what an earlier stage left there finds nothing. A `surefire:test` stage then **passes with 0 tests**, a jib stage fails | Stages that reuse `target/` (Unstable Tests, Deliver) run with `-Dmaven.build.cache.enabled=false`. The Test stage itself is a full `clean install` | T1 |
+| G11 | A Maven run with the cache on moves the existing `target/` outputs aside: a stage reusing what an earlier stage left there finds nothing. A `surefire:test` stage then **passes with 0 tests**, a jib stage fails | Stages that reuse `target/` (Unstable Tests, Deliver) run with `-Dmaven.build.cache.enabled=false`. The Test branches themselves are lifecycle builds (`clean verify`) | T1 |
 | G12 | A release image depends on cache state | Tag builds run with the cache off: nothing read, nothing written, everything built and tested from source | T4, Jenkins e2e |
 | G13 | A James bump changes code or a library version a TMail module uses, transitively, while the jars it declares stay identical: its key would not change | Per-module fingerprint of the dependency tree (James jars by content, libraries by version). It relies on James jars being reproducible, which holds on real James (see [estimate.md](estimate.md)) | G13, G17, M5, M8, T2 |
 | G14 | A change in properties, `dependencyManagement` or resource settings of a pom leaves the keys unchanged | Module and parent poms hashed | G14 |
 | G15 | An interrupted upload leaves an incomplete entry, or one later completed by another build of the same key (files of one build, metadata of another) | nginx only serves an entry once the cleanup job, every minute, has checked its files against the SHA-256 hashes of its `buildinfo.xml`: an inconsistent entry is deleted before anyone can restore it. Uploads left without `buildinfo.xml` are deleted after a day. A file lost after verification only fails the restore: the module is rebuilt, and master (saving without `remote.save.final`) uploads the missing file again | O2, O3, O4 |
 | G16 | A CI flag (`-D...`) changes what the build produces without changing the key | The executed pipeline repeats the Test stage flags in `build.cache.ci.flags` (in the key); the workspace Jenkinsfile is hashed too | G16 |
+| G18 | The Test stage runs as two `-pl` builds. By default the extension only knows the selected modules: a dependency on a TMail module of the other branch is keyed by its installed jar. With reproducible jars, a change two modules down (`jmap/extensions` under the app under the JMAP tests) leaves the key unchanged: stale results restored. Without, these modules are never restored | `<multiModule><discovery/></multiModule>`: the extension reads every pom of `tmail-backend/`, keys come from sources whatever the selection | G18, T2 |
+| G19 | A TMail module outside `tmail-backend/` (`logback-contrib`) is rebuilt by every Compile stage with a different jar: the apps declaring it, and everything depending on them (JMAP integration and deployment tests), are never restored. Checked on TMail: two builds of `logback-contrib` give different jars | `project.build.outputTimestamp` in TMail's root pom (reproducible jars; with it, two builds give identical jars). The fingerprint hashes these jars like James's | G19 |
+| G20 | The two Test branches share one source tree: `clean` in the other modules' branch deletes the apps' classes and jib images while the integration and deployment tests read them | The other modules' branch runs on its own copy of the sources (`<workspace>@test-modules`, fingerprints included, no `target/`); the integration branch keeps the workspace, with what the Compile stage built. `verify`, not `install`, so neither branch writes to the local repository. The copy sits next to the workspace, at the same depth: the parent poms and Jenkinsfile hashed up the tree (G14, G16) are then the same files' content in both trees, and a module gets the same key wherever it is built | T2, T3 |
+| G21 | Two pipelines run on the same agent and share `~/.m2`: one's Compile stage replaces the James, `logback-contrib` or TMail SNAPSHOT jars the other's Test stage uses. A master build would then test other code than the sources its keys come from, and save the result under its keys | Every Maven run of a pipeline uses a local repository private to it (`-Dmaven.repo.local=$WORKSPACE/.repository`), with the agent's `~/.m2` as a read-only tail (`-Dmaven.repo.local.tail`) for the dependencies it already holds. Not needed if each agent runs one build at a time | Jenkinsfile (the triage gives each agent its own repository; the Jenkins run builds one pipeline at a time) |
 
 ## 6. Cache server: nginx, shared by projects
 
@@ -188,11 +203,13 @@ and the inputs of section 4 for that project (what it gets from outside its reac
 
 ## 7. Jenkins pipeline for TMail
 
-Today: `Compile` runs `mvn clean install -DskipTests -T1C` from the root, `Test` runs `mvn surefire:test` from `tmail-backend/`,
-`Unstable Tests` runs `surefire:test -Punstable-tests`, the delivery stages run `jib:build` per app.
+Today (TMail's branch `fasten-tmail-build-08-10-2026`): `Compile` runs `mvn clean install -DskipTests -T1C` from the root; `Test`
+runs two `mvn surefire:test -Pci-test -pl <modules>` builds side by side from `tmail-backend/`: the modules under `integration-tests/`
+and `deployment-tests/`, and every other module (split computed from the directories, `failFast`); `Unstable Tests` runs
+`surefire:test -Punstable-tests`; the delivery stages run `jib:build` per app.
 
-**Today's stages cannot simply be kept with the cache** (T1): the `surefire:test` stage, run with the cache on, moves the compiled
-tests aside and passes with 0 tests; the delivery fails. The Test stage has to become a lifecycle build.
+**Today's stages cannot simply be kept with the cache** (T1): a `surefire:test` build run with the cache on moves the compiled tests
+aside and passes with 0 tests; the delivery fails. The Test branches have to become lifecycle builds.
 
 ### Who uses the cache
 
@@ -204,60 +221,73 @@ tests aside and passes with 0 tests; the delivery fails. The Test stage has to b
 | nightly master (timer) | off | Catches what the key cannot see (G9) |
 | manual `IGNORE_BUILD_CACHE=true` | off | Escape hatch |
 
-### Option A: keep today's split (validated: T2, Jenkins e2e)
+### Proposed stages (validated: T2, Jenkins e2e)
 
 | Stage | Command | Cache |
 |---|---|---|
-| Compile | root: `mvn clean install -DskipTests -T1C` (unchanged) | none |
-| Test | `tmail-backend/`: `ci/build-cache-fingerprint.sh com.linagora.tmail <the stage's settings and flags>`, then `mvn clean install` (**was** `surefire:test`) | read; master writes |
-| Unstable Tests | `tmail-backend/`: `mvn surefire:test -Punstable-tests -Dmaven.build.cache.enabled=false` | off |
-| Deliver | `tmail-backend/`: `mvn -Pci jib:build -pl apps/... -Dmaven.build.cache.enabled=false` | off |
+| Compile | root: `mvn clean install -DskipTests -T1C` (unchanged, but into the pipeline's own local repository, G21) | none |
+| Prepare Test (**new**) | `tmail-backend/`: `ci/build-cache-fingerprint.sh <the Test stage's settings and flags>`; then a copy of what the other modules' branch reads into `<workspace>@test-modules`, next to the workspace: the root `pom.xml` and `Jenkinsfile` (in the keys), `ci/` and `tmail-backend/` with the fingerprints, without `target/` (TMail: about 20 MB) | none |
+| Test: integration and deployment tests | workspace `tmail-backend/`: `ci/build-cache-fingerprint.sh --check`, then `mvn clean verify -pl <integration modules>` (**was** `surefire:test`) | read; master writes |
+| Test: other modules | `<workspace>@test-modules/tmail-backend/`: `ci/build-cache-fingerprint.sh --check`, then `mvn clean verify -pl !<integration modules>` (**was** `surefire:test`, in the workspace) | read; master writes |
+| Unstable Tests | workspace `tmail-backend/`: `mvn surefire:test -Punstable-tests -Dmaven.build.cache.enabled=false` | off |
+| Deliver | workspace `tmail-backend/`: `mvn -Pci jib:build -pl apps/... -Dmaven.build.cache.enabled=false` | off |
 
-Cost: a changed TMail module is compiled twice per pipeline (Compile, then Test after `clean`). Unchanged modules are restored in the
-Test stage, compiled classes included.
+Why the other modules' branch moves to a copy (G20): the apps are in that branch, and the deployment tests of the other branch
+load the apps' `target/jib-image.tar` by path. In one shared tree, `clean` in the apps would delete the images (and classes) the other
+branch is reading. With the copy, the workspace keeps what the Compile stage built: the integration branch reads the apps from there
+(jars from `~/.m2`, images from `target/`), and so do the Unstable Tests and delivery stages.
 
-### Option B: Compile builds James only (validated in the sample: T3, with a caveat)
+A first version put the copy inside the workspace (`test-modules/`): the ancestor includes then also reached the workspace's own
+root pom and Jenkinsfile, so modules got other keys in the copy than in the workspace (found by Codex). Not stale, but entries
+only served the tree that saved them. T2 now checks that one build of every module in the workspace restores what the two
+branches saved. The cleanup removes the copy along with the workspace.
 
-Same as A, but the Compile stage only builds what TMail needs from outside `tmail-backend/`: the root pom, `james-project`,
-`logback-contrib` (in the sample: `mvn -N install` at the root, then `mvn clean install -DskipTests` in `james-project/`).
-TMail is then compiled once, in the Test stage. Compile errors in TMail show in the Test stage instead.
+Cache-off builds (tags, nightly, `IGNORE_BUILD_CACHE`) run today's Test stage commands, plus `-Dmaven.build.cache.enabled=false`:
+`tmail-backend/.mvn/` enables the cache by default, and `surefire:test` with the cache on runs no test (T1). No fingerprint, no copy.
 
-**Caveat for TMail**: running Maven from `james-project/` loads James's own `.mvn/extensions.xml`, i.e. Develocity, with its remote
-cache and build scans. The sample's James has no `.mvn/`, so T3 does not show it. Option B would have to turn Develocity off
-explicitly (tags included), or build James from the root with a module selection. Option A has no such issue.
+Cost: a changed TMail module is compiled twice per pipeline (Compile, then its Test branch after `clean`). Unchanged modules are
+restored, compiled classes included.
 
-The cache behaves the same in both options: the Test stage does not depend on what the Compile stage built, and the fingerprint
-step only needs James installed (it collects dependency trees, it does not need TMail's modules built).
-A single Maven run from the root is not an option: it would run the James test suite.
+The earlier option of a Compile stage building James only (TMail compiled once, in the Test stage) no longer fits: the integration
+branch needs the apps built by the Compile stage. A single Maven run from the root is not an option either: it would run the James
+test suite.
 
 ### Pipeline details (sample: [`tmail-sample/Jenkinsfile`](../tmail-sample/Jenkinsfile))
 
-- Cache options of the Test stage: `-Dmaven.build.cache.enabled=false` for tags, nightly and `IGNORE_BUILD_CACHE`; otherwise
-  `-Dmaven.build.cache.remote.url=https://<host>/tmail -Dmaven.build.cache.location=$WORKSPACE/.build-cache
-  '-Dbuild.cache.ci.flags=<the Test stage flags>'`, plus
+- Cache options of each Test branch: `-Dmaven.build.cache.remote.url=https://<host>/tmail
+  -Dmaven.build.cache.location=$WORKSPACE/.build-cache-<branch> '-Dbuild.cache.ci.flags=<the Test stage flags>'`, plus
   `-Dmaven.build.cache.remote.save.enabled=true` and the writer credential (through `withCredentials`) on master only.
-- **The Test stage flags are defined once** (`testStageFlags()` in the sample Jenkinsfile, TMail: `-Dapi.version=1.43`) and passed both
-  to Maven and in `build.cache.ci.flags`, so the key follows the pipeline actually executed (G16).
+  Both branches of a master build upload entries, for different modules; their build reports go under a random id, no conflict.
+- **The Test stage flags are defined once** (`testStageFlags()` in the sample Jenkinsfile, TMail: `-Dapi.version=1.43 -Pci-test`)
+  and passed both to Maven and in `build.cache.ci.flags`, so the key follows the pipeline actually executed (G16).
+- `failFast` aborts the other branch when one fails, possibly in the middle of an upload on master: an incomplete entry is never
+  served (G15).
+- Every Maven run uses `-Dmaven.repo.local=$WORKSPACE/.repository -Dmaven.repo.local.tail=$HOME/.m2/repository` (G21). The tail is
+  read-only: a dependency missing from `~/.m2` is downloaded by every pipeline until `~/.m2` is refreshed (a periodic job, or a
+  pre-filled agent image). Today, without the cache, two concurrent pipelines on one agent can already test against each
+  other's jars.
 - **The fingerprint step must run before every cache-enabled Test stage**, with the same settings and flags as the stage:
   without `.build-cache-key/`, G13 is gone. The script fails, and the stage with it, when Maven fails, when a James SNAPSHOT jar
   of a dependency tree is missing from the local repository or cannot be hashed, when a tree line is not understood, or when a
   module (a `pom.xml` below `tmail-backend/`) got no fingerprint. It hashes the James jars of the local repositories Maven
   reports for the same arguments (settings and `.mvn/maven.config` included): those the Compile stage installed, as long as no
   remote repository serves newer James SNAPSHOTs (otherwise run both offline). `.build-cache-key/` is git-ignored;
-  the step took about 20 s on a laptop on TMail (96 modules), dependencies already downloaded.
-- TMail tees the Test stage output to `ci-logs` before Jenkins masks secrets. On master, where the writer credential is in the
-  environment, run the Test stage outside `tee` (failure reports are posted to pull requests, which have no credential).
+  the step took about 20 s on a laptop on TMail (97 modules), dependencies already downloaded. Each Test branch then runs
+  `ci/build-cache-fingerprint.sh --check` on its tree: a first version of this setup lost the fingerprints in the copy, and the
+  other modules' branch restored stale results after a James change instead of failing (now checked in G13).
+- TMail tees each Test branch to `ci-logs` before Jenkins masks secrets. On master, where the writer credential is in the
+  environment, run the Test branches outside `tee` (failure reports are posted to pull requests, which have no credential).
 - Fork PRs run the Jenkinsfile of the target branch, so a PR cannot change who gets the credential. Add `tmail-backend/.mvn/` to the
   Jenkinsfile's `protectedCiPaths()`, next to the root `.mvn/`.
 - The `junit` step of the Test stage needs `allowEmptyResults: true`: when every module is a hit, no report exists.
-- `-T1C` (parallel builds) was not covered by the triage: to check on TMail.
+- `-T1C` (parallel builds inside one Maven run) was not covered by the triage: to check on TMail if wanted.
 - Cost to measure: with `runAlways` on jib `buildTar` (G5), the Test stage rebuilds each app's image tar even when every module is a
   hit. TMail builds several apps; if that dominates a fully cached Test stage, the tars could instead be built only when the
   deployment tests are not restored.
 
 ## 8. Triage
 
-`tmail-sample/` mirrors TMail's layout and stages (see [its README](../tmail-sample/README.md)). `scripts/triage.sh` runs 27 scenarios,
+`tmail-sample/` mirrors TMail's layout and stages (see [its README](../tmail-sample/README.md)). `scripts/triage.sh` runs 29 scenarios,
 each from an empty cache and fresh agents; `scripts/jenkins-e2e.sh` runs the pipeline in Jenkins (master, branch, nightly-like and
 tag builds). Results: [triage.md](triage.md).
 
@@ -293,7 +323,9 @@ Known limits of this setup, accepted for a proof of concept:
   Test stage without updating `testStageFlags()`) are not in the key. Only CI writes; developers reading the cache would need the same
   discipline.
 - **Test selection files** (`includesFile`, `excludesFile`): their path is tracked, not their content. CI does not use them.
-- **Inputs outside `src/` read by tests** in TMail (beyond the jib tars and `sample-configuration/`): to audit during the POC.
+- **Inputs outside `src/` read by tests** in TMail (beyond the jib tars and `sample-configuration/`): to audit during the POC. The
+  other modules' Test branch only has `pom.xml`, `Jenkinsfile`, `ci/` and `tmail-backend/` in its copy: a test reading another root
+  folder fails there, loudly.
 
 Open questions for the TMail proof of concept:
 
@@ -301,5 +333,6 @@ Open questions for the TMail proof of concept:
   fingerprint step). Replaying TMail's history gives 50 to 78 minutes of test work skipped per master build on average (gross,
   before overheads), against 35 to 53 with the James revision in the key: see [estimate.md](estimate.md).
 - `-T1C` with the cache in the Test stage.
-- Option A or B for the Compile stage.
+- A test passing on a retry (`-Pci-test`) is cached as passed, as the build is green today: it is not run again until its module
+  or a dependency changes.
 - Who hosts the nginx instance and holds the writer credentials.

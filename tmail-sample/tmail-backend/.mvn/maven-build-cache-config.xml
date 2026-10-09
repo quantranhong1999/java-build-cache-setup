@@ -17,6 +17,14 @@
         <validateXml>true</validateXml>
         <!-- G4: only save builds that ran 'clean', never from a target/ holding leftovers of an earlier build -->
         <mandatoryClean>true</mandatoryClean>
+        <!-- G18: TMail's Test stage runs as two builds side by side, each with -pl on part of the modules. Without discovery,
+             the extension only knows the selected modules: a dependency on another TMail module is keyed by its installed
+             jar (rebuilt by every Compile stage) instead of its sources, so these modules would never be restored, and a
+             change two modules down would go unnoticed if that jar stayed the same. Discovery reads every module's pom
+             from tmail-backend/, so keys are the same whatever the -pl selection -->
+        <multiModule>
+            <discovery/>
+        </multiModule>
         <!-- Reads only by default. CI's master job alone adds -Dmaven.build.cache.remote.save.enabled=true (G7),
              without remote.save.final, so that it can complete an entry an interrupted upload left incomplete.
              The server hosts several projects, one folder each: TMail's is /tmail -->
@@ -105,7 +113,7 @@
         </runAlways>
 
         <!-- G1: a cached module is only reused when these values match the build that saved it: every way to skip,
-             select or ignore tests. A mismatch rebuilds the module.
+             select, retry (TMail's -Pci-test) or ignore tests. A mismatch rebuilds the module.
              skipValue: a value that makes the plugin do less. A cached build that ran the tests can serve a build
              that skips them; a cached build that skipped them can never serve a build that runs them. -->
         <reconcile>
@@ -126,6 +134,7 @@
                         <reconcile propertyName="includeJUnit5Engines"/>
                         <reconcile propertyName="excludeJUnit5Engines"/>
                         <reconcile propertyName="skipAfterFailureCount"/>
+                        <reconcile propertyName="rerunFailingTestsCount"/>
                     </reconciles>
                 </plugin>
                 <plugin artifactId="maven-failsafe-plugin" goal="integration-test">
@@ -144,6 +153,7 @@
                         <reconcile propertyName="includeJUnit5Engines"/>
                         <reconcile propertyName="excludeJUnit5Engines"/>
                         <reconcile propertyName="skipAfterFailureCount"/>
+                        <reconcile propertyName="rerunFailingTestsCount"/>
                     </reconciles>
                 </plugin>
                 <plugin artifactId="maven-failsafe-plugin" goal="verify">
